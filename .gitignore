@@ -1,0 +1,15 @@
+build/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.coverage
+htmlcov/
+runs/
+examples/petsc_dumps/downloaded/
+examples/petsc_dumps/**/*.bin
+*.egg-info/
+dist/
+*.swp
+.*.swp
