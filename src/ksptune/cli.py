@@ -709,7 +709,7 @@ def build_parser() -> argparse.ArgumentParser:
     tune.add_argument("--repeat", type=int, default=1)
     tune.add_argument("--warmup", type=int, default=0)
     tune.add_argument("--timeout", type=float)
-    tune.add_argument("--objective", default="objective_sec")
+    tune.add_argument("--objective", default="solve_time_seconds_mean")
     tune.add_argument(
         "--nullspace",
         default="from-metadata",

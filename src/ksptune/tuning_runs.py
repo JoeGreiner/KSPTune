@@ -436,7 +436,7 @@ def run_tuning(
     repeat: int = 1,
     warmup: int = 0,
     timeout_seconds: float | None = None,
-    objective_name: str = "objective_sec",
+    objective_name: str = "solve_time_seconds_mean",
     seed: int = 1,
     dry_run: bool = False,
     run_until_stopped: bool = False,
