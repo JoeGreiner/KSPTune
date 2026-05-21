@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
@@ -116,13 +117,19 @@ struct replay_result {
   double solve_time_sec_total = 0.0;
   double solve_time_sec_mean = 0.0;
   double solve_time_sec_median = 0.0;
+  double solve_time_sec_min = 0.0;
+  double solve_time_sec_max = 0.0;
+  double solve_time_sec_stddev = 0.0;
+  double solve_time_sec_range = 0.0;
   double initial_true_residual_norm_mean = 0.0;
   double initial_true_relative_residual_mean = 0.0;
   double final_true_residual_norm_mean = 0.0;
   double final_true_relative_residual_mean = 0.0;
-  std::vector<double> peak_memory_megabytes_per_rank;
-  double peak_memory_megabytes_max = 0.0;
-  double peak_memory_megabytes_sum = 0.0;
+  std::vector<double> peak_memory_mb_per_rank;
+  double peak_memory_mb_max_per_rank = 0.0;
+  double peak_memory_mb_mean_per_rank = 0.0;
+  double peak_memory_mb_sum = 0.0;
+  int peak_memory_rank_count = 0;
   double iterations_median = 0.0;
   double iterations_total = 0.0;
   bool converged = true;
@@ -709,7 +716,7 @@ PetscErrorCode collect_matrix_diagnostics(Mat matrix,
   return 0;
 }
 
-double local_peak_memory_megabytes()
+double local_peak_memory_mb()
 {
   rusage usage;
   if(getrusage(RUSAGE_SELF, &usage) != 0) return 0.0;
@@ -718,17 +725,17 @@ double local_peak_memory_megabytes()
 
 void collect_memory_diagnostics(replay_result& result)
 {
-  const double local_peak_memory = local_peak_memory_megabytes();
+  const double local_peak_memory = local_peak_memory_mb();
   MPI_Allreduce(
       &local_peak_memory,
-      &result.peak_memory_megabytes_max,
+      &result.peak_memory_mb_max_per_rank,
       1,
       MPI_DOUBLE,
       MPI_MAX,
       PETSC_COMM_WORLD);
   MPI_Allreduce(
       &local_peak_memory,
-      &result.peak_memory_megabytes_sum,
+      &result.peak_memory_mb_sum,
       1,
       MPI_DOUBLE,
       MPI_SUM,
@@ -738,12 +745,16 @@ void collect_memory_diagnostics(replay_result& result)
   int communicator_size = 1;
   MPI_Comm_rank(PETSC_COMM_WORLD, &rank);
   MPI_Comm_size(PETSC_COMM_WORLD, &communicator_size);
-  if(rank == 0) result.peak_memory_megabytes_per_rank.resize(size_t(communicator_size));
+  result.peak_memory_rank_count = communicator_size;
+  result.peak_memory_mb_mean_per_rank = communicator_size > 0
+      ? result.peak_memory_mb_sum / double(communicator_size)
+      : 0.0;
+  if(rank == 0) result.peak_memory_mb_per_rank.resize(size_t(communicator_size));
   MPI_Gather(
       &local_peak_memory,
       1,
       MPI_DOUBLE,
-      rank == 0 ? result.peak_memory_megabytes_per_rank.data() : nullptr,
+      rank == 0 ? result.peak_memory_mb_per_rank.data() : nullptr,
       1,
       MPI_DOUBLE,
       0,
@@ -911,6 +922,37 @@ double median(std::vector<double> values)
   const size_t mid = values.size() / 2;
   if(values.size() % 2) return values[mid];
   return 0.5 * (values[mid - 1] + values[mid]);
+}
+
+double population_stddev(const std::vector<double>& values)
+{
+  if(values.empty()) return 0.0;
+  const double values_mean = mean(values);
+  double squared_delta_sum = 0.0;
+  for(double value : values) {
+    const double delta = value - values_mean;
+    squared_delta_sum += delta * delta;
+  }
+  return std::sqrt(squared_delta_sum / double(values.size()));
+}
+
+double value_range(const std::vector<double>& values)
+{
+  if(values.empty()) return 0.0;
+  auto [minimum, maximum] = std::minmax_element(values.begin(), values.end());
+  return *maximum - *minimum;
+}
+
+double minimum_value(const std::vector<double>& values)
+{
+  if(values.empty()) return 0.0;
+  return *std::min_element(values.begin(), values.end());
+}
+
+double maximum_value(const std::vector<double>& values)
+{
+  if(values.empty()) return 0.0;
+  return *std::max_element(values.begin(), values.end());
 }
 
 PetscErrorCode replay_snapshot(const replay_args& args,
@@ -1136,6 +1178,10 @@ void write_json_result(const replay_result& result, const std::string& path)
        << "  \"solve_time_sec_total\": " << result.solve_time_sec_total << ",\n"
        << "  \"solve_time_sec_mean\": " << result.solve_time_sec_mean << ",\n"
        << "  \"solve_time_sec_median\": " << result.solve_time_sec_median << ",\n"
+       << "  \"solve_time_sec_min\": " << result.solve_time_sec_min << ",\n"
+       << "  \"solve_time_sec_max\": " << result.solve_time_sec_max << ",\n"
+       << "  \"solve_time_sec_stddev\": " << result.solve_time_sec_stddev << ",\n"
+       << "  \"solve_time_sec_range\": " << result.solve_time_sec_range << ",\n"
        << "  \"initial_true_residual_norm_mean\": "
        << result.initial_true_residual_norm_mean << ",\n"
        << "  \"initial_true_relative_residual_mean\": "
@@ -1150,14 +1196,17 @@ void write_json_result(const replay_result& result, const std::string& path)
        << "  \"final_residual_norm_mean\": " << result.final_true_residual_norm_mean << ",\n"
        << "  \"final_relative_residual_mean\": "
        << result.final_true_relative_residual_mean << ",\n"
-       << "  \"peak_memory_megabytes_per_rank\": [";
-  for(size_t i = 0; i < result.peak_memory_megabytes_per_rank.size(); ++i) {
+       << "  \"peak_memory_mb_per_rank\": [";
+  for(size_t i = 0; i < result.peak_memory_mb_per_rank.size(); ++i) {
     if(i > 0) json << ", ";
-    json << result.peak_memory_megabytes_per_rank[i];
+    json << result.peak_memory_mb_per_rank[i];
   }
   json << "],\n"
-       << "  \"peak_memory_megabytes_max\": " << result.peak_memory_megabytes_max << ",\n"
-       << "  \"peak_memory_megabytes_sum\": " << result.peak_memory_megabytes_sum << ",\n"
+       << "  \"peak_memory_mb_max_per_rank\": " << result.peak_memory_mb_max_per_rank << ",\n"
+       << "  \"peak_memory_mb_mean_per_rank\": " << result.peak_memory_mb_mean_per_rank
+       << ",\n"
+       << "  \"peak_memory_mb_sum\": " << result.peak_memory_mb_sum << ",\n"
+       << "  \"peak_memory_rank_count\": " << result.peak_memory_rank_count << ",\n"
        << "  \"converged\": " << (result.converged ? "true" : "false") << ",\n"
        << "  \"reason\": \"" << reason_string(result.reason_code) << "\",\n"
        << "  \"reason_code\": " << result.reason_code << ",\n"
@@ -1316,6 +1365,10 @@ PetscErrorCode run_replay(const replay_args& args)
   aggregate.solve_time_sec_total = std::accumulate(solve_times.begin(), solve_times.end(), 0.0);
   aggregate.solve_time_sec_mean = mean(solve_times);
   aggregate.solve_time_sec_median = median(solve_times);
+  aggregate.solve_time_sec_min = minimum_value(solve_times);
+  aggregate.solve_time_sec_max = maximum_value(solve_times);
+  aggregate.solve_time_sec_stddev = population_stddev(solve_times);
+  aggregate.solve_time_sec_range = value_range(solve_times);
   aggregate.solve_count = int(solve_times.size());
   aggregate.objective_time_sec_median = aggregate.solve_time_sec_median;
   aggregate.iterations_median = median(iteration_counts);

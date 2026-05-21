@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import subprocess
 import time
@@ -27,13 +28,19 @@ NUMERIC_REPLAY_RESULT_FIELDS = {
     "solve_time_sec_total",
     "solve_time_sec_mean",
     "solve_time_sec_median",
+    "solve_time_sec_min",
+    "solve_time_sec_max",
+    "solve_time_sec_stddev",
+    "solve_time_sec_range",
     "iterations_total",
     "initial_true_residual_norm_mean",
     "initial_true_relative_residual_mean",
     "final_true_residual_norm_mean",
     "final_true_relative_residual_mean",
-    "peak_memory_megabytes_max",
-    "peak_memory_megabytes_sum",
+    "peak_memory_mb_max_per_rank",
+    "peak_memory_mb_mean_per_rank",
+    "peak_memory_mb_sum",
+    "peak_memory_rank_count",
     "solve_count",
     "field_nullspace_index",
     "field_nullspace_block_size",
@@ -126,11 +133,11 @@ def validate_replay_result(
         errors.append("replay metric must be integer: reason_code")
     if "steps" in replay_result and not isinstance(replay_result["steps"], list):
         errors.append("replay metric must be a list: steps")
-    if "peak_memory_megabytes_per_rank" in replay_result and not isinstance(
-        replay_result["peak_memory_megabytes_per_rank"],
+    if "peak_memory_mb_per_rank" in replay_result and not isinstance(
+        replay_result["peak_memory_mb_per_rank"],
         list,
     ):
-        errors.append("replay metric must be a list: peak_memory_megabytes_per_rank")
+        errors.append("replay metric must be a list: peak_memory_mb_per_rank")
 
     return errors
 
@@ -200,6 +207,14 @@ def expected_solve_count(replay_result: dict[str, Any]) -> int | None:
     return None
 
 
+def population_stddev(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    values_mean = sum(values) / len(values)
+    squared_delta_sum = sum((value - values_mean) ** 2 for value in values)
+    return math.sqrt(squared_delta_sum / len(values))
+
+
 def replay_metric_summary(replay_result: dict[str, Any]) -> dict[str, Any]:
     metric_names = [
         "total_wall_time_sec",
@@ -208,10 +223,16 @@ def replay_metric_summary(replay_result: dict[str, Any]) -> dict[str, Any]:
         "solve_time_sec_total",
         "solve_time_sec_mean",
         "solve_time_sec_median",
+        "solve_time_sec_min",
+        "solve_time_sec_max",
+        "solve_time_sec_stddev",
+        "solve_time_sec_range",
         "iterations_total",
         "iterations_median",
-        "peak_memory_megabytes_max",
-        "peak_memory_megabytes_sum",
+        "peak_memory_mb_max_per_rank",
+        "peak_memory_mb_mean_per_rank",
+        "peak_memory_mb_sum",
+        "peak_memory_rank_count",
         "initial_true_residual_norm_mean",
         "initial_true_relative_residual_mean",
         "final_true_residual_norm_mean",
@@ -229,7 +250,7 @@ def replay_metric_summary(replay_result: dict[str, Any]) -> dict[str, Any]:
         "nullspace_actions",
         "field_nullspace_index",
         "field_nullspace_block_size",
-                    "matrix_nullspace_attached_count",
+        "matrix_nullspace_attached_count",
         "transpose_nullspace_attached_count",
         "near_nullspace_attached_count",
         "rhs_nullspace_removed_count",
@@ -255,6 +276,35 @@ def replay_metric_summary(replay_result: dict[str, Any]) -> dict[str, Any]:
         ):
             summary["solve_time_sec_total"] = (
                 float(replay_result["solve_time_sec_mean"]) * int(summary["solve_count"])
+            )
+
+    if solve_times:
+        summary.setdefault("solve_time_sec_min", min(solve_times))
+        summary.setdefault("solve_time_sec_max", max(solve_times))
+        summary.setdefault("solve_time_sec_stddev", population_stddev(solve_times))
+        summary.setdefault("solve_time_sec_range", max(solve_times) - min(solve_times))
+
+    memory_per_rank = replay_result.get("peak_memory_mb_per_rank")
+    if isinstance(memory_per_rank, list):
+        numeric_memory_values = [
+            float(value) for value in memory_per_rank if is_number(value)
+        ]
+        if numeric_memory_values:
+            summary.setdefault("peak_memory_rank_count", len(numeric_memory_values))
+            summary.setdefault("peak_memory_mb_sum", sum(numeric_memory_values))
+            summary.setdefault("peak_memory_mb_max_per_rank", max(numeric_memory_values))
+            summary.setdefault(
+                "peak_memory_mb_mean_per_rank",
+                sum(numeric_memory_values) / len(numeric_memory_values),
+            )
+    elif is_number(summary.get("peak_memory_mb_sum")) and is_number(
+        summary.get("peak_memory_rank_count")
+    ):
+        rank_count = int(summary["peak_memory_rank_count"])
+        if rank_count > 0:
+            summary.setdefault(
+                "peak_memory_mb_mean_per_rank",
+                float(summary["peak_memory_mb_sum"]) / rank_count,
             )
 
     return summary

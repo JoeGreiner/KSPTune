@@ -60,10 +60,13 @@ def format_sec(value: Any) -> str:
     return f"{float(value):.3f}s"
 
 
-def format_megabytes(value: Any) -> str:
+def format_mb(value: Any) -> str:
     if value is None:
         return "n/a"
-    return f"{float(value):.1f}MB"
+    numeric_value = float(value)
+    if abs(numeric_value) >= 1024:
+        return f"{numeric_value / 1024.0:.1f}GB"
+    return f"{numeric_value:.1f}MB"
 
 
 def format_float(value: Any) -> str:
@@ -287,18 +290,66 @@ def format_solve_runtime(event: dict[str, Any]) -> str:
 
     solve_total = event.get("solve_time_sec_total")
     solve_mean = event.get("solve_time_sec_mean")
+    solve_median = event.get("solve_time_sec_median")
+    solve_min = event.get("solve_time_sec_min")
+    solve_max = event.get("solve_time_sec_max")
     if solve_count_int is not None and solve_count_int > 1:
         if solve_total is None and solve_mean is not None:
             solve_total = float(solve_mean) * solve_count_int
         if solve_total is not None:
             if solve_mean is None:
                 solve_mean = float(solve_total) / solve_count_int
-            return (
-                f"{format_sec(solve_total)} "
-                f"(avg={format_sec(solve_mean)}, n={solve_count_int})"
-            )
+            details = [f"samples={solve_count_int}", f"avg={format_sec(solve_mean)}"]
+            if solve_min is not None and solve_max is not None:
+                details.append(f"min-max={format_sec(solve_min)}-{format_sec(solve_max)}")
+            return f"{format_sec(solve_total)} ({', '.join(details)})"
 
-    return format_sec(event.get("solve_time_sec_median"))
+    return format_sec(solve_median)
+
+
+def format_iterations(event: dict[str, Any]) -> str:
+    iterations_total = event.get("iterations_total")
+    if iterations_total is None:
+        return "n/a"
+
+    try:
+        solve_count = int(event["solve_count"]) if event.get("solve_count") is not None else None
+    except (TypeError, ValueError):
+        solve_count = None
+
+    details = []
+    if solve_count is not None and solve_count > 0:
+        details.append(f"samples={solve_count}")
+        details.append(f"mean={format_float(float(iterations_total) / solve_count)}")
+
+    text = format_float(iterations_total)
+    return f"{text} ({', '.join(details)})" if details else text
+
+
+def format_memory_summary(event: dict[str, Any]) -> str:
+    memory_total = event.get("peak_memory_mb_sum")
+    memory_mean_per_rank = event.get("peak_memory_mb_mean_per_rank")
+    rank_count = event.get("peak_memory_rank_count")
+    try:
+        rank_count_int = int(rank_count) if rank_count is not None else None
+    except (TypeError, ValueError):
+        rank_count_int = None
+
+    if memory_total is None and memory_mean_per_rank is not None and rank_count_int:
+        memory_total = float(memory_mean_per_rank) * rank_count_int
+
+    if memory_total is not None:
+        details = []
+        if rank_count_int:
+            details.append(f"ranks={rank_count_int}")
+        if memory_mean_per_rank is not None:
+            details.append(f"avg/rank={format_mb(memory_mean_per_rank)}")
+        suffix = f" ({', '.join(details)})" if details else ""
+        return f"total={format_mb(memory_total)}{suffix}"
+
+    if memory_mean_per_rank is not None:
+        return f"avg/rank={format_mb(memory_mean_per_rank)}"
+    return "n/a"
 
 
 def format_nullspace_configuration(configuration: dict[str, Any] | None) -> str:
@@ -496,7 +547,6 @@ def print_tune_progress(event: dict[str, Any], *, color_enabled: bool = False) -
 
     if event_name == "trial_finished":
         wall_time = format_sec(event.get("total_wall_time_sec"))
-        memory = format_megabytes(event.get("peak_memory_megabytes_max"))
         residual = format_float(event.get("final_true_relative_residual_mean"))
         solver_configuration = format_solver_configuration(event)
         failure_reason = event.get("failure_reason")
@@ -532,8 +582,8 @@ def print_tune_progress(event: dict[str, Any], *, color_enabled: bool = False) -
             setup_time = format_sec(event.get("solver_setup_time_sec"))
             solve_time = format_solve_runtime(event)
             lines.append(f"  runtime: solve={solve_time}  setup={setup_time}  wall={wall_time}")
-            iterations = event.get("iterations_total")
-            lines.append(f"  diagnostics: iters={iterations if iterations is not None else 'n/a'}  mem={memory}  true_rel_res={residual}")
+            lines.append(f"  memory: {format_memory_summary(event)}")
+            lines.append(f"  diagnostics: iters={format_iterations(event)}  true_rel_res={residual}")
         print_block(lines)
         return
 

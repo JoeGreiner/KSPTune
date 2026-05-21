@@ -58,10 +58,20 @@ TRIAL_CSV_COLUMNS = [
     "subprocess_wall_time_sec",
     "matrix_load_time_sec",
     "solver_setup_time_sec",
-    "solve_time_sec_median",
+    "solve_time_sec_total",
     "solve_time_sec_mean",
+    "solve_time_sec_median",
+    "solve_time_sec_min",
+    "solve_time_sec_max",
+    "solve_time_sec_stddev",
+    "solve_time_sec_range",
+    "solve_count",
     "iterations_total",
-    "peak_memory_megabytes_max",
+    "iterations_median",
+    "peak_memory_mb_sum",
+    "peak_memory_mb_max_per_rank",
+    "peak_memory_mb_mean_per_rank",
+    "peak_memory_rank_count",
     "final_true_relative_residual_mean",
     "final_true_residual_norm_mean",
     "nullspace",
@@ -272,7 +282,18 @@ def compact_trial_summary(record: dict[str, Any] | None) -> dict[str, Any] | Non
         "smac_configuration_tag": record.get("smac_configuration_tag"),
         "objective_value": record.get("objective_value"),
         "total_wall_time_sec": record.get("total_wall_time_sec"),
-        "peak_memory_megabytes_max": record.get("peak_memory_megabytes_max"),
+        "solve_time_sec_total": record.get("solve_time_sec_total"),
+        "solve_time_sec_mean": record.get("solve_time_sec_mean"),
+        "solve_time_sec_median": record.get("solve_time_sec_median"),
+        "solve_time_sec_min": record.get("solve_time_sec_min"),
+        "solve_time_sec_max": record.get("solve_time_sec_max"),
+        "solve_time_sec_stddev": record.get("solve_time_sec_stddev"),
+        "solve_time_sec_range": record.get("solve_time_sec_range"),
+        "solve_count": record.get("solve_count"),
+        "peak_memory_mb_sum": record.get("peak_memory_mb_sum"),
+        "peak_memory_mb_max_per_rank": record.get("peak_memory_mb_max_per_rank"),
+        "peak_memory_mb_mean_per_rank": record.get("peak_memory_mb_mean_per_rank"),
+        "peak_memory_rank_count": record.get("peak_memory_rank_count"),
         "final_true_relative_residual_mean": record.get("final_true_relative_residual_mean"),
         "solver_configuration": record.get("solver_configuration"),
         "petsc_options": record.get("petsc_options"),
@@ -302,9 +323,14 @@ def build_tuning_summary(
         )
 
     memory_values = [
-        float(record["peak_memory_megabytes_max"])
+        float(record["peak_memory_mb_max_per_rank"])
         for record in records
-        if is_number(record.get("peak_memory_megabytes_max"))
+        if is_number(record.get("peak_memory_mb_max_per_rank"))
+    ]
+    memory_sum_values = [
+        float(record["peak_memory_mb_sum"])
+        for record in records
+        if is_number(record.get("peak_memory_mb_sum"))
     ]
 
     return {
@@ -317,7 +343,8 @@ def build_tuning_summary(
         "converged_trial_count": len(converged_records),
         "best_trial": compact_trial_summary(best_record),
         "fastest_converged_trial": compact_trial_summary(fastest_converged_record),
-        "peak_memory_megabytes_max": max(memory_values) if memory_values else None,
+        "peak_memory_mb_max_per_rank": max(memory_values) if memory_values else None,
+        "peak_memory_mb_sum_max": max(memory_sum_values) if memory_sum_values else None,
     }
 
 

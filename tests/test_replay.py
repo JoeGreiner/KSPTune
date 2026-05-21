@@ -18,6 +18,10 @@ def valid_replay_result() -> dict:
         "solve_time_sec_total": 0.18,
         "solve_time_sec_mean": 0.09,
         "solve_time_sec_median": 0.1,
+        "solve_time_sec_min": 0.08,
+        "solve_time_sec_max": 0.1,
+        "solve_time_sec_stddev": 0.01,
+        "solve_time_sec_range": 0.02,
         "solve_count": 2,
         "iterations_total": 5,
         "snapshots": 2,
@@ -27,8 +31,11 @@ def valid_replay_result() -> dict:
         "field_nullspace_block_size": 2,
         "converged": True,
         "reason_code": 2,
-        "peak_memory_megabytes_max": 100.0,
-        "peak_memory_megabytes_sum": 100.0,
+        "peak_memory_mb_per_rank": [100.0],
+        "peak_memory_mb_max_per_rank": 100.0,
+        "peak_memory_mb_mean_per_rank": 100.0,
+        "peak_memory_mb_sum": 100.0,
+        "peak_memory_rank_count": 1,
         "initial_true_residual_norm_mean": 1.0,
         "initial_true_relative_residual_mean": 1.0,
         "final_true_residual_norm_mean": 1.0e-8,
@@ -84,16 +91,26 @@ def test_replay_metric_summary_keeps_diagnostics() -> None:
 
     assert summary["total_wall_time_sec"] == 0.2
     assert summary["solve_time_sec_total"] == 0.18
+    assert summary["solve_time_sec_min"] == 0.08
+    assert summary["solve_time_sec_max"] == 0.1
+    assert summary["solve_time_sec_stddev"] == 0.01
+    assert summary["solve_time_sec_range"] == 0.02
     assert summary["solve_count"] == 2
     assert summary["nullspace"] == "field"
     assert summary["field_nullspace_index"] == 1
-    assert summary["peak_memory_megabytes_max"] == 100.0
+    assert summary["peak_memory_mb_max_per_rank"] == 100.0
+    assert summary["peak_memory_mb_mean_per_rank"] == 100.0
+    assert summary["peak_memory_rank_count"] == 1
     assert summary["final_true_relative_residual_mean"] == 1.0e-9
 
 
 def test_replay_metric_summary_derives_solve_total_and_count_for_old_results() -> None:
     replay_result = valid_replay_result()
     replay_result.pop("solve_time_sec_total")
+    replay_result.pop("solve_time_sec_min")
+    replay_result.pop("solve_time_sec_max")
+    replay_result.pop("solve_time_sec_stddev")
+    replay_result.pop("solve_time_sec_range")
     replay_result.pop("solve_count")
     replay_result["steps"] = [
         {"solve_time_sec": 0.2},
@@ -103,4 +120,27 @@ def test_replay_metric_summary_derives_solve_total_and_count_for_old_results() -
     summary = replay_metric_summary(replay_result)
 
     assert summary["solve_time_sec_total"] == 0.5
+    assert summary["solve_time_sec_min"] == 0.2
+    assert summary["solve_time_sec_max"] == 0.3
+    assert summary["solve_time_sec_stddev"] == 0.04999999999999999
+    assert summary["solve_time_sec_range"] == 0.09999999999999998
     assert summary["solve_count"] == 2
+
+
+def test_replay_metric_summary_derives_memory_rank_aggregates() -> None:
+    replay_result = valid_replay_result()
+    for key in (
+        "peak_memory_mb_sum",
+        "peak_memory_mb_max_per_rank",
+        "peak_memory_mb_mean_per_rank",
+        "peak_memory_rank_count",
+    ):
+        replay_result.pop(key)
+    replay_result["peak_memory_mb_per_rank"] = [64.0, 128.0, 96.0]
+
+    summary = replay_metric_summary(replay_result)
+
+    assert summary["peak_memory_mb_sum"] == 288.0
+    assert summary["peak_memory_mb_max_per_rank"] == 128.0
+    assert summary["peak_memory_mb_mean_per_rank"] == 96.0
+    assert summary["peak_memory_rank_count"] == 3

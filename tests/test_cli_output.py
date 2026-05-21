@@ -329,7 +329,12 @@ def test_tune_progress_prints_readable_trial_line(capsys) -> None:
             "total_wall_time_sec": 0.15,
             "solver_setup_time_sec": 0.03,
             "solve_time_sec_median": 0.10,
-            "peak_memory_megabytes_max": 151.25,
+            "iterations_total": 5,
+            "iterations_median": 5,
+            "solve_count": 1,
+            "peak_memory_mb_sum": 151.25,
+            "peak_memory_mb_mean_per_rank": 151.25,
+            "peak_memory_rank_count": 1,
             "final_true_relative_residual_mean": 1.0e-9,
             "solver_configuration": {"ksp_type": "cg", "pc_type": "jacobi"},
             "smac_configuration_tag": "abc123",
@@ -343,8 +348,8 @@ def test_tune_progress_prints_readable_trial_line(capsys) -> None:
     assert output.startswith("\ntrial 003/020 [abc123] ok  objective: 0.1234  (best: 0.101)")
     assert "  solver: ksp=cg pc=jacobi" in output
     assert "  runtime: solve=0.100s  setup=0.030s  wall=0.150s" in output
-    assert "mem=151.2MB" in output
-    assert "true_rel_res=1.000e-09" in output
+    assert "  memory: total=151.2MB (ranks=1, avg/rank=151.2MB)" in output
+    assert "  diagnostics: iters=5 (samples=1, mean=5)  true_rel_res=1.000e-09" in output
     assert output.endswith("\n")
     assert not output.endswith("\n\n")
 
@@ -361,8 +366,15 @@ def test_tune_progress_prints_total_and_average_solve_time(capsys) -> None:
             "solve_time_sec_total": 232.1,
             "solve_time_sec_mean": 4.12,
             "solve_time_sec_median": 3.9,
+            "solve_time_sec_min": 3.25,
+            "solve_time_sec_max": 5.5,
+            "solve_time_sec_stddev": 0.5,
+            "solve_time_sec_range": 2.25,
             "solve_count": 56,
-            "peak_memory_megabytes_max": 151.25,
+            "peak_memory_mb_sum": 1210.0,
+            "peak_memory_mb_max_per_rank": 160.0,
+            "peak_memory_mb_mean_per_rank": 151.25,
+            "peak_memory_rank_count": 8,
             "final_true_relative_residual_mean": 1.0e-9,
             "solver_configuration": {"ksp_type": "cg", "pc_type": "jacobi"},
             "smac_configuration_tag": "abc123",
@@ -373,7 +385,11 @@ def test_tune_progress_prints_total_and_average_solve_time(capsys) -> None:
     )
 
     output = capsys.readouterr().out
-    assert "  runtime: solve=232.100s (avg=4.120s, n=56)  setup=0.030s  wall=250.000s" in output
+    assert (
+        "  runtime: solve=232.100s (samples=56, avg=4.120s, "
+        "min-max=3.250s-5.500s)  setup=0.030s  wall=250.000s"
+    ) in output
+    assert "  memory: total=1.2GB (ranks=8, avg/rank=151.2MB)" in output
 
 
 def test_tune_progress_colorizes_successful_trial_line(capsys) -> None:
@@ -386,7 +402,7 @@ def test_tune_progress_colorizes_successful_trial_line(capsys) -> None:
             "total_wall_time_sec": 0.15,
             "solver_setup_time_sec": 0.03,
             "solve_time_sec_median": 0.10,
-            "peak_memory_megabytes_max": 151.25,
+            "peak_memory_mb_max_per_rank": 151.25,
             "final_true_relative_residual_mean": 1.0e-9,
             "solver_configuration": {"ksp_type": "cg", "pc_type": "jacobi"},
             "smac_configuration_tag": "abc123",
@@ -419,7 +435,7 @@ def test_tune_progress_colorizes_new_best_objective_green(capsys) -> None:
             "total_wall_time_sec": 0.15,
             "solver_setup_time_sec": 0.03,
             "solve_time_sec_median": 0.10,
-            "peak_memory_megabytes_max": 151.25,
+            "peak_memory_mb_max_per_rank": 151.25,
             "final_true_relative_residual_mean": 1.0e-9,
             "solver_configuration": {"ksp_type": "cg", "pc_type": "jacobi"},
             "smac_configuration_tag": "be5701",
@@ -447,7 +463,7 @@ def test_tune_progress_prints_open_ended_trial_count(capsys) -> None:
             "total_wall_time_sec": 0.15,
             "solver_setup_time_sec": 0.03,
             "solve_time_sec_median": 0.10,
-            "peak_memory_megabytes_max": 151.25,
+            "peak_memory_mb_max_per_rank": 151.25,
             "final_true_relative_residual_mean": 1.0e-9,
             "solver_configuration": {"ksp_type": "cg", "pc_type": "jacobi"},
             "smac_configuration_tag": "def456",
@@ -469,7 +485,7 @@ def test_tune_progress_colorizes_failed_trial_line(capsys) -> None:
             "trial_count": 2,
             "objective_value": cli_module.BAD_COST,
             "total_wall_time_sec": 0.2,
-            "peak_memory_megabytes_max": 200.0,
+            "peak_memory_mb_max_per_rank": 200.0,
             "final_true_relative_residual_mean": 0.4,
             "solver_configuration": {"ksp_type": "cg", "pc_type": "none"},
             "smac_configuration_tag": "7bb1e4",
@@ -528,7 +544,7 @@ def test_tune_progress_prints_failure_reason(capsys) -> None:
             "trial_count": 2,
             "objective_value": cli_module.BAD_COST,
             "total_wall_time_sec": 0.2,
-            "peak_memory_megabytes_max": 200.0,
+            "peak_memory_mb_max_per_rank": 200.0,
             "final_true_relative_residual_mean": 0.4,
             "solver_configuration": {"ksp_type": "cg", "pc_type": "none"},
             "smac_configuration_tag": "7bb1e4",

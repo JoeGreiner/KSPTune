@@ -17,7 +17,7 @@ def test_write_tuning_summary_outputs_ranks_successful_trials_first(tmp_path: Pa
             "failure_reason": "not converged: KSP_DIVERGED_ITS",
             "converged": False,
             "total_wall_time_sec": 0.20,
-            "peak_memory_megabytes_max": 256.0,
+            "peak_memory_mb_max_per_rank": 256.0,
             "final_true_relative_residual_mean": 0.5,
             "solver_configuration": {"ksp_type": "cg", "pc_type": "none"},
             "petsc_options": ["-ksp_type", "cg", "-pc_type", "none"],
@@ -33,7 +33,7 @@ def test_write_tuning_summary_outputs_ranks_successful_trials_first(tmp_path: Pa
             "failure_reason": None,
             "converged": True,
             "total_wall_time_sec": 0.08,
-            "peak_memory_megabytes_max": 128.0,
+            "peak_memory_mb_max_per_rank": 128.0,
             "final_true_relative_residual_mean": 1.0e-9,
             "solver_configuration": {"ksp_type": "cg", "pc_type": "jacobi"},
             "petsc_options": ["-ksp_type", "cg", "-pc_type", "jacobi"],
@@ -51,7 +51,7 @@ def test_write_tuning_summary_outputs_ranks_successful_trials_first(tmp_path: Pa
     assert summary["failed_trial_count"] == 1
     assert summary["best_trial"]["trial_number"] == 2
     assert summary["best_trial"]["smac_configuration_tag"] == "best02"
-    assert summary["peak_memory_megabytes_max"] == 256.0
+    assert summary["peak_memory_mb_max_per_rank"] == 256.0
     assert (tmp_path / "tuning_summary.yaml").exists()
 
     ranking_rows = list(csv.DictReader((tmp_path / "solver_configuration_rankings.csv").open()))
