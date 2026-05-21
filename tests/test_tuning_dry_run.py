@@ -31,29 +31,29 @@ def write_minimal_snapshot(directory: Path, solve_index: int = 0) -> None:
 def test_initial_design_helpers_count_only_tunable_hyperparameters() -> None:
     parameter_search_space = load_parameter_search_space("petsc.hypre-basic")
 
-    assert len(parameter_search_space) == 20
-    assert count_tunable_hyperparameters(parameter_search_space) == 13
+    assert len(parameter_search_space) == 12
+    assert count_tunable_hyperparameters(parameter_search_space) == 8
     assert resolve_sobol_initial_design_configuration_count(
-        tunable_parameter_count=13,
+        tunable_parameter_count=8,
         workers=1,
         effective_trials=100,
         default_solver_configuration_count=1,
-        additional_solver_configuration_count=8,
-    ) == 26
+        additional_solver_configuration_count=4,
+    ) == 16
     assert resolve_sobol_initial_design_configuration_count(
-        tunable_parameter_count=13,
+        tunable_parameter_count=8,
         workers=8,
         effective_trials=100,
         default_solver_configuration_count=1,
-        additional_solver_configuration_count=8,
+        additional_solver_configuration_count=4,
     ) == 32
     assert resolve_sobol_initial_design_configuration_count(
-        tunable_parameter_count=13,
+        tunable_parameter_count=8,
         workers=4,
         effective_trials=12,
         default_solver_configuration_count=1,
-        additional_solver_configuration_count=8,
-    ) == 3
+        additional_solver_configuration_count=4,
+    ) == 7
 
 
 def test_hypre_basicinitial_solver_configurations_are_legal() -> None:
@@ -67,12 +67,8 @@ def test_hypre_basicinitial_solver_configurations_are_legal() -> None:
     assert labels == [
         "joe_hypre_opts8",
         "joe_hypre_opts9_projected",
-        "joe_hypre_opts10",
-        "joe_hypre_opts6_projected",
         "joe_hypre_opts4_projected",
-        "joe_hypre_opts5_projected",
         "joe_hypre_opts3_projected",
-        "joe_hypre_opts2_projected",
     ]
     assert "joe_hypre_opts11" not in labels
     for record in records:
@@ -476,20 +472,20 @@ def test_tuning_configures_default_and_seeded_initial_design(
 
     assert captured["scenario"].use_default_config is True
     assert captured["initial_design"] is not None
-    assert captured["initial_design_kwargs"]["n_configs"] == 3
+    assert captured["initial_design_kwargs"]["n_configs"] == 7
     assert captured["initial_design_kwargs"]["max_ratio"] == 1.0
-    assert len(captured["initial_design_kwargs"]["additional_configs"]) == 8
+    assert len(captured["initial_design_kwargs"]["additional_configs"]) == 4
 
     tuning_run = yaml.safe_load((output_directory / "tuning_run.yaml").read_text(encoding="utf-8"))
     assert tuning_run["use_default_solver_configuration"] is True
-    assert tuning_run["tunable_parameter_count"] == 13
-    assert tuning_run["sobol_initial_design_configurations"] == 3
-    assert tuning_run["additionalinitial_solver_configuration_count"] == 8
+    assert tuning_run["tunable_parameter_count"] == 8
+    assert tuning_run["sobol_initial_design_configurations"] == 7
+    assert tuning_run["additionalinitial_solver_configuration_count"] == 4
     assert tuning_run["additionalinitial_solver_configurations"][0] == "joe_hypre_opts8"
 
     run_started = next(event for event in events if event["event"] == "run_started")
-    assert run_started["sobol_initial_design_configurations"] == 3
-    assert run_started["additionalinitial_solver_configuration_count"] == 8
+    assert run_started["sobol_initial_design_configurations"] == 7
+    assert run_started["additionalinitial_solver_configuration_count"] == 4
 
 
 def test_known_smac_empty_neighbor_runtime_warning_is_filtered() -> None:

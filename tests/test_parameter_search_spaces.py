@@ -25,7 +25,7 @@ def test_builtin_parameter_search_spaces_are_loadable() -> None:
     assert "hyperparameters:" in parameter_search_space_to_yaml(parameter_search_space)
 
 
-def test_petsc_hypre_basic_defaults_match_joe_hypre_opts12_baseline() -> None:
+def test_petsc_hypre_basic_defaults_match_tuned_baseline() -> None:
     parameter_search_space = load_parameter_search_space("petsc.hypre-basic")
     solver_configuration = default_solver_configuration_from_parameter_search_space(
         parameter_search_space
@@ -36,23 +36,17 @@ def test_petsc_hypre_basic_defaults_match_joe_hypre_opts12_baseline() -> None:
         "ksp_pc_side": "right",
         "pc_type": "hypre",
         "pc_hypre_type": "boomeramg",
-        "pc_hypre_boomeramg_max_iter": 1,
-        "pc_hypre_boomeramg_tol": 0.0,
-        "pc_hypre_boomeramg_cycle_type": "V",
-        "pc_hypre_boomeramg_measure_type": "local",
-        "pc_hypre_boomeramg_interp_refine": 0,
         "pc_hypre_boomeramg_coarsen_type": "PMIS",
-        "pc_hypre_boomeramg_interp_type": "ext+i-cc",
+        "pc_hypre_boomeramg_interp_type": "ext+i-mm",
         "pc_hypre_boomeramg_relax_type_all": "l1-Gauss-Seidel",
-        "pc_hypre_boomeramg_relax_type_coarse": "l1scaled-Jacobi",
         "pc_hypre_boomeramg_P_max": 4,
         "pc_hypre_boomeramg_agg_nl": 0,
-        "pc_hypre_boomeramg_nodal_coarsen": 3,
         "pc_hypre_boomeramg_truncfactor": 0.0,
-        "pc_hypre_boomeramg_strong_threshold": 0.075,
+        "pc_hypre_boomeramg_strong_threshold": 0.1,
     }
     for name, value in expected_values.items():
         assert solver_configuration[name] == value
+    assert "pc_hypre_boomeramg_agg_num_paths" not in solver_configuration
 
     options = render_petsc_options_from_solver_configuration(
         parameter_search_space,
@@ -63,9 +57,11 @@ def test_petsc_hypre_basic_defaults_match_joe_hypre_opts12_baseline() -> None:
     assert "-pc_hypre_boomeramg_P_max" in options
     assert "4" in options
     assert "-pc_hypre_boomeramg_interp_type" in options
-    assert "ext+i-cc" in options
-    assert "-pc_hypre_boomeramg_nodal_coarsen" in options
-    assert "3" in options
+    assert "ext+i-mm" in options
+    assert "-pc_hypre_boomeramg_agg_num_paths" not in options
+    assert "-pc_hypre_boomeramg_cycle_type" not in options
+    assert "-pc_hypre_boomeramg_measure_type" not in options
+    assert "-pc_hypre_boomeramg_nodal_coarsen" not in options
     assert "-pc_hypre_boomeramg_truncfactor" not in options
     assert not parameter_search_space["ksp_type"].legal_value("cg")
 
@@ -78,36 +74,65 @@ def test_petsc_hypre_basic_contains_joe_hypre_option_ranges() -> None:
         "pc_hypre_boomeramg_interp_type": ["ext+i", "ext+i-cc", "ext+i-mm", "FF"],
         "pc_hypre_boomeramg_relax_type_all": [
             "l1-Gauss-Seidel",
-            "symmetric-SOR/Jacobi",
-            "Jacobi",
-            "FCF-Jacobi",
-        ],
-        "pc_hypre_boomeramg_relax_type_coarse": [
-            "Gaussian-elimination",
-            "Jacobi",
             "l1scaled-Jacobi",
-            "Chebyshev",
         ],
-        "pc_hypre_boomeramg_P_max": [3, 4, 8],
-        "pc_hypre_boomeramg_agg_nl": [0, 1, 4],
-        "pc_hypre_boomeramg_agg_num_paths": [2, 3],
-        "pc_hypre_boomeramg_nodal_coarsen": [3],
+        "pc_hypre_boomeramg_P_max": [2, 3, 4, 5, 6, 8],
+        "pc_hypre_boomeramg_agg_nl": [0, 1, 2],
+        "pc_hypre_boomeramg_agg_num_paths": [1, 2, 3],
     }
     for parameter_name, values in categorical_joe_hypre_option_values.items():
         for value in values:
             assert parameter_search_space[parameter_name].legal_value(value)
 
+    assert not parameter_search_space["pc_hypre_boomeramg_coarsen_type"].legal_value("Falgout")
+    assert not parameter_search_space["pc_hypre_boomeramg_agg_nl"].legal_value(4)
+    assert not parameter_search_space["pc_hypre_boomeramg_agg_num_paths"].legal_value(0)
+    for removed_relax_type in ["symmetric-SOR/Jacobi", "Jacobi", "FCF-Jacobi"]:
+        assert not parameter_search_space["pc_hypre_boomeramg_relax_type_all"].legal_value(
+            removed_relax_type
+        )
+    for removed_parameter in [
+        "pc_hypre_boomeramg_cycle_type",
+        "pc_hypre_boomeramg_measure_type",
+        "pc_hypre_boomeramg_nodal_coarsen",
+        "pc_hypre_boomeramg_relax_type_coarse",
+        "pc_hypre_boomeramg_relax_weight_all",
+    ]:
+        assert removed_parameter not in parameter_search_space
+
     strong_threshold_values = list(
         parameter_search_space["pc_hypre_boomeramg_strong_threshold"].sequence
     )
     truncfactor_values = list(parameter_search_space["pc_hypre_boomeramg_truncfactor"].sequence)
-    relax_weight_values = list(
-        parameter_search_space["pc_hypre_boomeramg_relax_weight_all"].sequence
-    )
 
     assert strong_threshold_values == [round(index * 0.025, 3) for index in range(1, 29)]
     assert truncfactor_values == [round(index * 0.025, 3) for index in range(0, 17)]
-    assert relax_weight_values == [round(0.8 + index * 0.025, 3) for index in range(0, 9)]
+
+
+def test_petsc_hypre_basic_agg_num_paths_is_conditional() -> None:
+    parameter_search_space = load_parameter_search_space("petsc.hypre-basic")
+    solver_configuration = default_solver_configuration_from_parameter_search_space(
+        parameter_search_space
+    )
+
+    default_options = render_petsc_options_from_solver_configuration(
+        parameter_search_space,
+        solver_configuration,
+    )
+    assert "-pc_hypre_boomeramg_agg_num_paths" not in default_options
+
+    solver_configuration.update(
+        {
+            "pc_hypre_boomeramg_agg_nl": 1,
+            "pc_hypre_boomeramg_agg_num_paths": 2,
+        }
+    )
+    active_options = render_petsc_options_from_solver_configuration(
+        parameter_search_space,
+        solver_configuration,
+    )
+    assert "-pc_hypre_boomeramg_agg_num_paths" in active_options
+    assert "2" in active_options
 
 
 def test_petsc_options_render_readable_float_values() -> None:
@@ -117,7 +142,6 @@ def test_petsc_options_render_readable_float_values() -> None:
     )
     solver_configuration.update(
         {
-            "pc_hypre_boomeramg_relax_weight_all": 0.825,
             "pc_hypre_boomeramg_strong_threshold": 0.1,
             "pc_hypre_boomeramg_truncfactor": 0.05,
         }
@@ -130,10 +154,8 @@ def test_petsc_options_render_readable_float_values() -> None:
         )
     )
 
-    assert "-pc_hypre_boomeramg_relax_weight_all 0.825" in options_text
     assert "-pc_hypre_boomeramg_strong_threshold 0.1" in options_text
     assert "-pc_hypre_boomeramg_truncfactor 0.05" in options_text
-    assert "0.82499999999999996" not in options_text
     assert "0.10000000000000001" not in options_text
     assert "0.050000000000000003" not in options_text
 
