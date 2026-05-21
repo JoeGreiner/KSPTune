@@ -12,11 +12,11 @@ def test_write_tuning_summary_outputs_ranks_successful_trials_first(tmp_path: Pa
         {
             "trial_number": 1,
             "smac_configuration_tag": "failed1",
-            "objective_name": "objective_sec",
+            "objective_name": "objective_time_sec_median",
             "objective_value": BAD_COST,
             "failure_reason": "not converged: KSP_DIVERGED_ITS",
             "converged": False,
-            "total_wall_time_seconds": 0.20,
+            "total_wall_time_sec": 0.20,
             "peak_memory_megabytes_max": 256.0,
             "final_true_relative_residual_mean": 0.5,
             "solver_configuration": {"ksp_type": "cg", "pc_type": "none"},
@@ -28,11 +28,11 @@ def test_write_tuning_summary_outputs_ranks_successful_trials_first(tmp_path: Pa
         {
             "trial_number": 2,
             "smac_configuration_tag": "best02",
-            "objective_name": "objective_sec",
+            "objective_name": "objective_time_sec_median",
             "objective_value": 0.05,
             "failure_reason": None,
             "converged": True,
-            "total_wall_time_seconds": 0.08,
+            "total_wall_time_sec": 0.08,
             "peak_memory_megabytes_max": 128.0,
             "final_true_relative_residual_mean": 1.0e-9,
             "solver_configuration": {"ksp_type": "cg", "pc_type": "jacobi"},
@@ -42,7 +42,7 @@ def test_write_tuning_summary_outputs_ranks_successful_trials_first(tmp_path: Pa
 
     summary = write_tuning_summary_outputs(
         output_directory=tmp_path,
-        objective_name="objective_sec",
+        objective_name="objective_time_sec_median",
         status="completed",
     )
 
@@ -65,7 +65,7 @@ def test_write_tuning_summary_outputs_handles_all_failed_trials(tmp_path: Path) 
         tmp_path / "solver_configuration_trials.jsonl",
         {
             "trial_number": 1,
-            "objective_name": "objective_sec",
+            "objective_name": "objective_time_sec_median",
             "objective_value": BAD_COST,
             "failure_reason": "subprocess failed with returncode 1",
             "converged": False,
@@ -76,7 +76,7 @@ def test_write_tuning_summary_outputs_handles_all_failed_trials(tmp_path: Path) 
 
     summary = write_tuning_summary_outputs(
         output_directory=tmp_path,
-        objective_name="objective_sec",
+        objective_name="objective_time_sec_median",
         status="completed",
     )
 

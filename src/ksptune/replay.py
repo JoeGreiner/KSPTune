@@ -8,25 +8,25 @@ from pathlib import Path
 from typing import Any
 
 REQUIRED_REPLAY_RESULT_FIELDS = {
-    "objective_sec",
-    "total_wall_time_seconds",
+    "objective_time_sec_median",
+    "total_wall_time_sec",
     "converged",
     "reason_code",
-    "solve_time_seconds_median",
-    "solver_setup_time_seconds",
+    "solve_time_sec_median",
+    "solver_setup_time_sec",
     "iterations_total",
     "snapshots",
     "steps",
 }
 
 NUMERIC_REPLAY_RESULT_FIELDS = {
-    "objective_sec",
-    "total_wall_time_seconds",
-    "matrix_load_time_seconds",
-    "solver_setup_time_seconds",
-    "solve_time_seconds_total",
-    "solve_time_seconds_mean",
-    "solve_time_seconds_median",
+    "objective_time_sec_median",
+    "total_wall_time_sec",
+    "matrix_load_time_sec",
+    "solver_setup_time_sec",
+    "solve_time_sec_total",
+    "solve_time_sec_mean",
+    "solve_time_sec_median",
     "iterations_total",
     "initial_true_residual_norm_mean",
     "initial_true_relative_residual_mean",
@@ -103,7 +103,7 @@ def is_number(value: Any) -> bool:
 def validate_replay_result(
     replay_result: dict[str, Any],
     *,
-    objective_name: str = "objective_sec",
+    objective_name: str = "solve_time_sec_mean",
 ) -> list[str]:
     errors: list[str] = []
     if not isinstance(replay_result, dict):
@@ -138,7 +138,7 @@ def validate_replay_result(
 def replay_failure_reason(
     replay_record: dict[str, Any],
     *,
-    objective_name: str = "objective_sec",
+    objective_name: str = "solve_time_sec_mean",
 ) -> str | None:
     if replay_record.get("failure_reason"):
         return str(replay_record["failure_reason"])
@@ -168,7 +168,7 @@ def replay_failure_reason(
 def replay_objective_value(
     replay_record: dict[str, Any],
     *,
-    objective_name: str = "objective_sec",
+    objective_name: str = "solve_time_sec_mean",
     bad_cost: float,
 ) -> float:
     if replay_failure_reason(replay_record, objective_name=objective_name):
@@ -188,7 +188,7 @@ def solve_step_times(replay_result: dict[str, Any]) -> list[float]:
     for step in steps:
         if not isinstance(step, dict):
             continue
-        value = step.get("solve_time_seconds", step.get("solve_sec"))
+        value = step.get("solve_time_sec")
         if is_number(value):
             solve_times.append(float(value))
     return solve_times
@@ -202,12 +202,12 @@ def expected_solve_count(replay_result: dict[str, Any]) -> int | None:
 
 def replay_metric_summary(replay_result: dict[str, Any]) -> dict[str, Any]:
     metric_names = [
-        "total_wall_time_seconds",
-        "matrix_load_time_seconds",
-        "solver_setup_time_seconds",
-        "solve_time_seconds_total",
-        "solve_time_seconds_mean",
-        "solve_time_seconds_median",
+        "total_wall_time_sec",
+        "matrix_load_time_sec",
+        "solver_setup_time_sec",
+        "solve_time_sec_total",
+        "solve_time_sec_mean",
+        "solve_time_sec_median",
         "iterations_total",
         "iterations_median",
         "peak_memory_megabytes_max",
@@ -247,14 +247,14 @@ def replay_metric_summary(replay_result: dict[str, Any]) -> dict[str, Any]:
         elif (expected_count := expected_solve_count(replay_result)) is not None:
             summary["solve_count"] = expected_count
 
-    if "solve_time_seconds_total" not in summary:
+    if "solve_time_sec_total" not in summary:
         if solve_times:
-            summary["solve_time_seconds_total"] = sum(solve_times)
-        elif is_number(replay_result.get("solve_time_seconds_mean")) and is_number(
+            summary["solve_time_sec_total"] = sum(solve_times)
+        elif is_number(replay_result.get("solve_time_sec_mean")) and is_number(
             summary.get("solve_count")
         ):
-            summary["solve_time_seconds_total"] = (
-                float(replay_result["solve_time_seconds_mean"]) * int(summary["solve_count"])
+            summary["solve_time_sec_total"] = (
+                float(replay_result["solve_time_sec_mean"]) * int(summary["solve_count"])
             )
 
     return summary
@@ -270,7 +270,7 @@ def run_replay_for_solver_configuration(
     mpi_processes: int = 1,
     repeat: int = 1,
     warmup: int = 0,
-    timeout_seconds: float | None = None,
+    timeout_sec: float | None = None,
     threads_per_rank: int = 1,
     extra_replay_options: list[str] | None = None,
 ) -> dict[str, Any]:
@@ -293,7 +293,7 @@ def run_replay_for_solver_configuration(
         completed = subprocess.run(
             command,
             check=False,
-            timeout=timeout_seconds,
+            timeout=timeout_sec,
             text=True,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -306,8 +306,8 @@ def run_replay_for_solver_configuration(
         returncode = None
         stdout = exc.stdout if isinstance(exc.stdout, str) else ""
         stderr = exc.stderr if isinstance(exc.stderr, str) else ""
-        failure_reason = f"replay command timed out after {timeout_seconds} seconds"
-    subprocess_walltime_seconds = time.perf_counter() - start_time
+        failure_reason = f"replay command timed out after {timeout_sec} seconds"
+    subprocess_wall_time_sec = time.perf_counter() - start_time
 
     replay_result: dict[str, Any] = {}
     schema_errors: list[str] = []
@@ -327,7 +327,7 @@ def run_replay_for_solver_configuration(
         "returncode": returncode,
         "stdout": stdout,
         "stderr": stderr,
-        "subprocess_walltime_seconds": subprocess_walltime_seconds,
+        "subprocess_wall_time_sec": subprocess_wall_time_sec,
         "replay_result_path": str(result_path),
         "replay_result": replay_result,
         "schema_errors": schema_errors,

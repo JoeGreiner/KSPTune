@@ -11,13 +11,13 @@ from ksptune.tuning_runs import BAD_COST
 
 def valid_replay_result() -> dict:
     return {
-        "objective_sec": 0.1,
-        "total_wall_time_seconds": 0.2,
-        "matrix_load_time_seconds": 0.03,
-        "solver_setup_time_seconds": 0.04,
-        "solve_time_seconds_total": 0.18,
-        "solve_time_seconds_mean": 0.09,
-        "solve_time_seconds_median": 0.1,
+        "objective_time_sec_median": 0.1,
+        "total_wall_time_sec": 0.2,
+        "matrix_load_time_sec": 0.03,
+        "solver_setup_time_sec": 0.04,
+        "solve_time_sec_total": 0.18,
+        "solve_time_sec_mean": 0.09,
+        "solve_time_sec_median": 0.1,
         "solve_count": 2,
         "iterations_total": 5,
         "snapshots": 2,
@@ -42,11 +42,11 @@ def test_validate_replay_result_accepts_clear_metric_names() -> None:
 
 def test_validate_replay_result_reports_missing_metric() -> None:
     replay_result = valid_replay_result()
-    replay_result.pop("total_wall_time_seconds")
+    replay_result.pop("total_wall_time_sec")
 
     errors = validate_replay_result(replay_result)
 
-    assert "missing replay metric: total_wall_time_seconds" in errors
+    assert "missing replay metric: total_wall_time_sec" in errors
 
 
 def test_replay_objective_uses_bad_cost_for_non_converged_result() -> None:
@@ -62,7 +62,7 @@ def test_replay_objective_uses_bad_cost_for_non_converged_result() -> None:
     assert replay_failure_reason(replay_record) == "not converged: KSP_DIVERGED_ITS"
     assert replay_objective_value(
         replay_record,
-        objective_name="objective_sec",
+        objective_name="objective_time_sec_median",
         bad_cost=BAD_COST,
     ) == BAD_COST
 
@@ -82,8 +82,8 @@ def test_replay_failure_reason_explains_petsc_signal_returncode() -> None:
 def test_replay_metric_summary_keeps_diagnostics() -> None:
     summary = replay_metric_summary(valid_replay_result())
 
-    assert summary["total_wall_time_seconds"] == 0.2
-    assert summary["solve_time_seconds_total"] == 0.18
+    assert summary["total_wall_time_sec"] == 0.2
+    assert summary["solve_time_sec_total"] == 0.18
     assert summary["solve_count"] == 2
     assert summary["nullspace"] == "field"
     assert summary["field_nullspace_index"] == 1
@@ -93,14 +93,14 @@ def test_replay_metric_summary_keeps_diagnostics() -> None:
 
 def test_replay_metric_summary_derives_solve_total_and_count_for_old_results() -> None:
     replay_result = valid_replay_result()
-    replay_result.pop("solve_time_seconds_total")
+    replay_result.pop("solve_time_sec_total")
     replay_result.pop("solve_count")
     replay_result["steps"] = [
-        {"solve_time_seconds": 0.2},
-        {"solve_sec": 0.3},
+        {"solve_time_sec": 0.2},
+        {"solve_time_sec": 0.3},
     ]
 
     summary = replay_metric_summary(replay_result)
 
-    assert summary["solve_time_seconds_total"] == 0.5
+    assert summary["solve_time_sec_total"] == 0.5
     assert summary["solve_count"] == 2

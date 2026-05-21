@@ -54,7 +54,7 @@ def color_enabled(color: str) -> bool:
     return sys.stdout.isatty()
 
 
-def format_seconds(value: Any) -> str:
+def format_sec(value: Any) -> str:
     if value is None:
         return "n/a"
     return f"{float(value):.3f}s"
@@ -84,7 +84,7 @@ def format_objective_value_text(event: dict[str, Any], value_key: str) -> str:
         return "bad-cost"
     text = format_float(numeric_value)
     objective_name = str(event.get("objective_name") or "")
-    if objective_name.endswith("_sec") or objective_name.endswith("_seconds"):
+    if "_sec" in objective_name:
         text = f"{text}s"
     return text
 
@@ -285,8 +285,8 @@ def format_solve_runtime(event: dict[str, Any]) -> str:
     except (TypeError, ValueError):
         solve_count_int = None
 
-    solve_total = event.get("solve_time_seconds_total")
-    solve_mean = event.get("solve_time_seconds_mean")
+    solve_total = event.get("solve_time_sec_total")
+    solve_mean = event.get("solve_time_sec_mean")
     if solve_count_int is not None and solve_count_int > 1:
         if solve_total is None and solve_mean is not None:
             solve_total = float(solve_mean) * solve_count_int
@@ -294,11 +294,11 @@ def format_solve_runtime(event: dict[str, Any]) -> str:
             if solve_mean is None:
                 solve_mean = float(solve_total) / solve_count_int
             return (
-                f"{format_seconds(solve_total)} "
-                f"(avg={format_seconds(solve_mean)}, n={solve_count_int})"
+                f"{format_sec(solve_total)} "
+                f"(avg={format_sec(solve_mean)}, n={solve_count_int})"
             )
 
-    return format_seconds(event.get("solve_time_seconds_median"))
+    return format_sec(event.get("solve_time_sec_median"))
 
 
 def format_nullspace_configuration(configuration: dict[str, Any] | None) -> str:
@@ -495,7 +495,7 @@ def print_tune_progress(event: dict[str, Any], *, color_enabled: bool = False) -
         return
 
     if event_name == "trial_finished":
-        wall_time = format_seconds(event.get("total_wall_time_seconds"))
+        wall_time = format_sec(event.get("total_wall_time_sec"))
         memory = format_megabytes(event.get("peak_memory_megabytes_max"))
         residual = format_float(event.get("final_true_relative_residual_mean"))
         solver_configuration = format_solver_configuration(event)
@@ -511,7 +511,7 @@ def print_tune_progress(event: dict[str, Any], *, color_enabled: bool = False) -
         if failure_reason:
             reason = short_text(failure_reason)
             lines.append(
-                f"  runtime: subprocess={format_seconds(event.get('subprocess_walltime_seconds'))}"
+                f"  runtime: subprocess={format_sec(event.get('subprocess_wall_time_sec'))}"
             )
             lines.extend(
                 wrapped_labeled_lines(
@@ -529,7 +529,7 @@ def print_tune_progress(event: dict[str, Any], *, color_enabled: bool = False) -
                     )
                 )
         else:
-            setup_time = format_seconds(event.get("solver_setup_time_seconds"))
+            setup_time = format_sec(event.get("solver_setup_time_sec"))
             solve_time = format_solve_runtime(event)
             lines.append(f"  runtime: solve={solve_time}  setup={setup_time}  wall={wall_time}")
             iterations = event.get("iterations_total")
@@ -592,7 +592,7 @@ def cmd_tune(args: argparse.Namespace) -> int:
         trials=args.trials,
         repeat=args.repeat,
         warmup=args.warmup,
-        timeout_seconds=args.timeout,
+        timeout_sec=args.timeout_sec,
         objective_name=args.objective,
         seed=args.seed,
         dry_run=args.dry_run,
@@ -708,8 +708,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     tune.add_argument("--repeat", type=int, default=1)
     tune.add_argument("--warmup", type=int, default=0)
-    tune.add_argument("--timeout", type=float)
-    tune.add_argument("--objective", default="solve_time_seconds_mean")
+    tune.add_argument("--timeout-sec", type=float)
+    tune.add_argument("--objective", default="solve_time_sec_mean")
     tune.add_argument(
         "--nullspace",
         default="from-metadata",

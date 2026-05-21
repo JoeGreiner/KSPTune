@@ -54,12 +54,12 @@ TRIAL_CSV_COLUMNS = [
     "failure_reason",
     "reason",
     "reason_code",
-    "total_wall_time_seconds",
-    "subprocess_walltime_seconds",
-    "matrix_load_time_seconds",
-    "solver_setup_time_seconds",
-    "solve_time_seconds_median",
-    "solve_time_seconds_mean",
+    "total_wall_time_sec",
+    "subprocess_wall_time_sec",
+    "matrix_load_time_sec",
+    "solver_setup_time_sec",
+    "solve_time_sec_median",
+    "solve_time_sec_mean",
     "iterations_total",
     "peak_memory_megabytes_max",
     "final_true_relative_residual_mean",
@@ -271,7 +271,7 @@ def compact_trial_summary(record: dict[str, Any] | None) -> dict[str, Any] | Non
         "trial_number": record.get("trial_number"),
         "smac_configuration_tag": record.get("smac_configuration_tag"),
         "objective_value": record.get("objective_value"),
-        "total_wall_time_seconds": record.get("total_wall_time_seconds"),
+        "total_wall_time_sec": record.get("total_wall_time_sec"),
         "peak_memory_megabytes_max": record.get("peak_memory_megabytes_max"),
         "final_true_relative_residual_mean": record.get("final_true_relative_residual_mean"),
         "solver_configuration": record.get("solver_configuration"),
@@ -293,12 +293,12 @@ def build_tuning_summary(
     best_record = min(successful_records, key=ranking_key) if successful_records else None
     fastest_converged_record = None
     converged_with_wall_time = [
-        record for record in converged_records if is_number(record.get("total_wall_time_seconds"))
+        record for record in converged_records if is_number(record.get("total_wall_time_sec"))
     ]
     if converged_with_wall_time:
         fastest_converged_record = min(
             converged_with_wall_time,
-            key=lambda record: float(record["total_wall_time_seconds"]),
+            key=lambda record: float(record["total_wall_time_sec"]),
         )
 
     memory_values = [
@@ -435,8 +435,8 @@ def run_tuning(
     trials: int | None = 20,
     repeat: int = 1,
     warmup: int = 0,
-    timeout_seconds: float | None = None,
-    objective_name: str = "solve_time_seconds_mean",
+    timeout_sec: float | None = None,
+    objective_name: str = "solve_time_sec_mean",
     seed: int = 1,
     dry_run: bool = False,
     run_until_stopped: bool = False,
@@ -530,7 +530,7 @@ def run_tuning(
             "run_until_stopped": run_until_stopped,
             "repeat": repeat,
             "warmup": warmup,
-            "timeout_seconds": timeout_seconds,
+            "timeout_sec": timeout_sec,
             "objective_name": objective_name,
             "nullspace": nullspace_configuration,
             "nullspace_actions": nullspace_action_configuration,
@@ -580,7 +580,7 @@ def run_tuning(
             "run_until_stopped": run_until_stopped,
             "repeat": repeat,
             "warmup": warmup,
-            "timeout_seconds": timeout_seconds,
+            "timeout_sec": timeout_sec,
             "objective_name": objective_name,
             "use_default_solver_configuration": use_default_solver_configuration,
             "tunable_parameter_count": tunable_parameter_count,
@@ -737,7 +737,7 @@ def run_tuning(
             mpi_processes=mpi_processes,
             repeat=repeat,
             warmup=warmup,
-            timeout_seconds=timeout_seconds,
+            timeout_sec=timeout_sec,
             threads_per_rank=threads_per_rank,
             extra_replay_options=nullspace_replay_options,
         )
@@ -762,7 +762,7 @@ def run_tuning(
             "returncode": replay_record["returncode"],
             "failure_reason": failure_reason,
             "schema_errors": replay_record.get("schema_errors", []),
-            "subprocess_walltime_seconds": replay_record.get("subprocess_walltime_seconds"),
+            "subprocess_wall_time_sec": replay_record.get("subprocess_wall_time_sec"),
             **replay_metric_summary(replay_result),
         }
         return cost, {"ksptune_trial_record": record}

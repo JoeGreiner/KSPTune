@@ -142,7 +142,7 @@ def run_petsc_snapshot_analysis(
         stderr=subprocess.PIPE,
         env=replay_environment(threads_per_rank),
     )
-    subprocess_walltime_seconds = time.perf_counter() - start_time
+    subprocess_wall_time_sec = time.perf_counter() - start_time
 
     petsc_result: dict[str, Any] = {}
     json_error: str | None = None
@@ -164,7 +164,7 @@ def run_petsc_snapshot_analysis(
         "returncode": completed.returncode,
         "stdout": completed.stdout,
         "stderr": completed.stderr,
-        "subprocess_walltime_seconds": subprocess_walltime_seconds,
+        "subprocess_wall_time_sec": subprocess_wall_time_sec,
         "result_path": str(petsc_result_path.resolve()),
         "json_error": json_error,
         "result": petsc_result,

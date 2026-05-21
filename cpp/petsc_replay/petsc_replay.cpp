@@ -98,7 +98,7 @@ struct matrix_diagnostics {
 struct step_result {
   int repeat_index = 0;
   int solve_index = 0;
-  double solve_time_seconds = 0.0;
+  double solve_time_sec = 0.0;
   double initial_true_residual_norm = 0.0;
   double rhs_norm = 0.0;
   double initial_true_relative_residual = 0.0;
@@ -109,13 +109,13 @@ struct step_result {
 };
 
 struct replay_result {
-  double objective_sec = 1.0e30;
-  double total_wall_time_seconds = 0.0;
-  double matrix_load_time_seconds = 0.0;
-  double solver_setup_time_seconds = 0.0;
-  double solve_time_seconds_total = 0.0;
-  double solve_time_seconds_mean = 0.0;
-  double solve_time_seconds_median = 0.0;
+  double objective_time_sec_median = 1.0e30;
+  double total_wall_time_sec = 0.0;
+  double matrix_load_time_sec = 0.0;
+  double solver_setup_time_sec = 0.0;
+  double solve_time_sec_total = 0.0;
+  double solve_time_sec_mean = 0.0;
+  double solve_time_sec_median = 0.0;
   double initial_true_residual_norm_mean = 0.0;
   double initial_true_relative_residual_mean = 0.0;
   double final_true_residual_norm_mean = 0.0;
@@ -947,7 +947,7 @@ PetscErrorCode replay_snapshot(const replay_args& args,
   KSPTUNE_PETSC_CALL(PetscTime(&load_end));
   double load_elapsed = double(load_end - load_start);
   MPI_Allreduce(MPI_IN_PLACE, &load_elapsed, 1, MPI_DOUBLE, MPI_MAX, PETSC_COMM_WORLD);
-  aggregate.matrix_load_time_seconds += load_elapsed;
+  aggregate.matrix_load_time_sec += load_elapsed;
 
   matrix_diagnostics diagnostics;
   KSPTUNE_PETSC_CALL(collect_matrix_diagnostics(matrix, args.diagnose_matrix, diagnostics));
@@ -1034,7 +1034,7 @@ PetscErrorCode replay_snapshot(const replay_args& args,
   KSPTUNE_PETSC_CALL(PetscTime(&t1));
   double setup_elapsed = double(t1 - t0);
   MPI_Allreduce(MPI_IN_PLACE, &setup_elapsed, 1, MPI_DOUBLE, MPI_MAX, PETSC_COMM_WORLD);
-  aggregate.solver_setup_time_seconds += setup_elapsed;
+  aggregate.solver_setup_time_sec += setup_elapsed;
 
   KSPType ksp_type = nullptr;
   PCType pc_type = nullptr;
@@ -1087,7 +1087,7 @@ PetscErrorCode replay_snapshot(const replay_args& args,
       step_result step;
       step.repeat_index = iteration - args.warmup;
       step.solve_index = snap.solve_index;
-      step.solve_time_seconds = solve_elapsed;
+      step.solve_time_sec = solve_elapsed;
       step.initial_true_residual_norm = initial_residual;
       step.rhs_norm = rhs_norm;
       step.initial_true_relative_residual = initial_relative;
@@ -1129,17 +1129,13 @@ void write_json_result(const replay_result& result, const std::string& path)
   std::ostringstream json;
   json << std::setprecision(17)
        << "{\n"
-       << "  \"objective_sec\": " << result.objective_sec << ",\n"
-       << "  \"total_wall_time_seconds\": " << result.total_wall_time_seconds << ",\n"
-       << "  \"matrix_load_time_seconds\": " << result.matrix_load_time_seconds << ",\n"
-       << "  \"solver_setup_time_seconds\": " << result.solver_setup_time_seconds << ",\n"
-       << "  \"solve_time_seconds_total\": " << result.solve_time_seconds_total << ",\n"
-       << "  \"solve_time_seconds_mean\": " << result.solve_time_seconds_mean << ",\n"
-       << "  \"solve_time_seconds_median\": " << result.solve_time_seconds_median << ",\n"
-       << "  \"solve_sec_total\": " << result.solve_time_seconds_total << ",\n"
-       << "  \"solve_sec_mean\": " << result.solve_time_seconds_mean << ",\n"
-       << "  \"solve_sec_median\": " << result.solve_time_seconds_median << ",\n"
-       << "  \"setup_sec\": " << result.solver_setup_time_seconds << ",\n"
+       << "  \"objective_time_sec_median\": " << result.objective_time_sec_median << ",\n"
+       << "  \"total_wall_time_sec\": " << result.total_wall_time_sec << ",\n"
+       << "  \"matrix_load_time_sec\": " << result.matrix_load_time_sec << ",\n"
+       << "  \"solver_setup_time_sec\": " << result.solver_setup_time_sec << ",\n"
+       << "  \"solve_time_sec_total\": " << result.solve_time_sec_total << ",\n"
+       << "  \"solve_time_sec_mean\": " << result.solve_time_sec_mean << ",\n"
+       << "  \"solve_time_sec_median\": " << result.solve_time_sec_median << ",\n"
        << "  \"initial_true_residual_norm_mean\": "
        << result.initial_true_residual_norm_mean << ",\n"
        << "  \"initial_true_relative_residual_mean\": "
@@ -1221,8 +1217,7 @@ void write_json_result(const replay_result& result, const std::string& path)
     json << "    {"
          << "\"repeat_index\": " << step.repeat_index << ", "
          << "\"solve_index\": " << step.solve_index << ", "
-         << "\"solve_time_seconds\": " << step.solve_time_seconds << ", "
-         << "\"solve_sec\": " << step.solve_time_seconds << ", "
+         << "\"solve_time_sec\": " << step.solve_time_sec << ", "
          << "\"initial_true_residual_norm\": " << step.initial_true_residual_norm << ", "
          << "\"rhs_norm\": " << step.rhs_norm << ", "
          << "\"initial_true_relative_residual\": "
@@ -1318,11 +1313,11 @@ PetscErrorCode run_replay(const replay_args& args)
     KSPTUNE_PETSC_CALL(replay_snapshot(args, snap, aggregate, solve_times, iteration_counts));
   }
 
-  aggregate.solve_time_seconds_total = std::accumulate(solve_times.begin(), solve_times.end(), 0.0);
-  aggregate.solve_time_seconds_mean = mean(solve_times);
-  aggregate.solve_time_seconds_median = median(solve_times);
+  aggregate.solve_time_sec_total = std::accumulate(solve_times.begin(), solve_times.end(), 0.0);
+  aggregate.solve_time_sec_mean = mean(solve_times);
+  aggregate.solve_time_sec_median = median(solve_times);
   aggregate.solve_count = int(solve_times.size());
-  aggregate.objective_sec = aggregate.solve_time_seconds_median;
+  aggregate.objective_time_sec_median = aggregate.solve_time_sec_median;
   aggregate.iterations_median = median(iteration_counts);
   aggregate.iterations_total = std::accumulate(iteration_counts.begin(), iteration_counts.end(), 0.0);
 
@@ -1342,15 +1337,15 @@ PetscErrorCode run_replay(const replay_args& args)
   aggregate.final_true_relative_residual_mean = mean(final_relatives);
 
   KSPTUNE_PETSC_CALL(PetscTime(&replay_end));
-  double total_wall_time_seconds = double(replay_end - replay_start);
+  double total_wall_time_sec = double(replay_end - replay_start);
   MPI_Allreduce(
       MPI_IN_PLACE,
-      &total_wall_time_seconds,
+      &total_wall_time_sec,
       1,
       MPI_DOUBLE,
       MPI_MAX,
       PETSC_COMM_WORLD);
-  aggregate.total_wall_time_seconds = total_wall_time_seconds;
+  aggregate.total_wall_time_sec = total_wall_time_sec;
   collect_memory_diagnostics(aggregate);
 
   write_json_result(aggregate, args.json_output_path);
