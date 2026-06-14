@@ -1,4 +1,9 @@
 build/
+/site/
+/.cache/
+/.venv-docs/
+.DS_Store
+.idea/
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -9,6 +14,9 @@ htmlcov/
 runs/
 examples/petsc_dumps/downloaded/
 examples/petsc_dumps/**/*.bin
+/examples/10x10x10_snapshots_indices_1_5_10_50_100/
+/examples/6x5x4_snapshots_indices_1_5_10_50_100/
+/examples/combined_dumps/
 *.egg-info/
 dist/
 *.swp
