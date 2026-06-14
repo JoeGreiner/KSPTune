@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -288,9 +290,100 @@ def load_snapshot_collection(snapshot_collection_path: str | Path) -> list[dict[
         return [normalize_snapshot_collection_row(row, path.parent) for row in reader]
 
 
+def file_sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    print(f"[snapshot_collections] hashing matrix file: {path}", flush=True)
+    chunk_size = 16 * 1024 * 1024
+    total_bytes = 0
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(chunk_size), b""):
+            total_bytes += len(chunk)
+            digest.update(chunk)
+    print(
+        f"[snapshot_collections] done hashing: {path} ({total_bytes / (1024 * 1024):.2f} MiB)",
+        flush=True,
+    )
+    return digest.hexdigest()
+
+
+def canonical_matrix_paths(rows: list[dict[str, Any]]) -> dict[str, str]:
+    matrix_groups: dict[tuple[int, int, int], list[str]] = {}
+    for row in rows:
+        matrix_path_text = str(row.get("A") or "")
+        if not matrix_path_text:
+            continue
+        matrix_path = Path(matrix_path_text)
+        try:
+            file_size = matrix_path.stat().st_size
+        except OSError:
+            continue
+        group_key = (int(row.get("rows") or 0), int(row.get("cols") or 0), file_size)
+        matrix_groups.setdefault(group_key, []).append(matrix_path_text)
+
+    candidate_groups: list[tuple[int, int, int, list[str]]] = []
+    for (rows_count, cols_count, file_size), paths in matrix_groups.items():
+        unique_paths = list(dict.fromkeys(paths))
+        if len(unique_paths) >= 2:
+            candidate_groups.append((rows_count, cols_count, file_size, unique_paths))
+
+    print(
+        f"[snapshot_collections] found {len(candidate_groups)} matrix groups with >=2 candidate files for deduplication",
+        flush=True,
+    )
+    if not candidate_groups:
+        print("[snapshot_collections] deduplication complete: no duplicate matrices detected", flush=True)
+        return {}
+
+    paths_to_hash = list(
+        dict.fromkeys(
+            path_text
+            for _, _, _, paths in candidate_groups
+            for path_text in paths
+        )
+    )
+    print(
+        f"[snapshot_collections] hashing {len(paths_to_hash)} unique candidate files in parallel",
+        flush=True,
+    )
+
+    path_hashes: dict[str, str] = {}
+    max_workers = min(len(paths_to_hash), max(1, os.cpu_count() or 1), 8)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        for path_text, matrix_hash in zip(paths_to_hash, executor.map(file_sha256, map(Path, paths_to_hash))):
+            path_hashes[path_text] = matrix_hash
+
+    canonical_paths: dict[str, str] = {}
+    for rows_count, cols_count, file_size, paths in candidate_groups:
+        print(
+            "[snapshot_collections] processing matrix group: "
+            f"{rows_count}x{cols_count}, size {file_size} bytes, {len(paths)} candidate files",
+            flush=True,
+        )
+
+        first_path_by_hash: dict[tuple[int, int, int, str], str] = {}
+        for path_text in paths:
+            matrix_hash = path_hashes[path_text]
+            dedupe_key = (rows_count, cols_count, file_size, matrix_hash)
+            canonical_paths[path_text] = first_path_by_hash.setdefault(dedupe_key, path_text)
+
+    if not canonical_paths:
+        print("[snapshot_collections] deduplication complete: no duplicate matrices detected", flush=True)
+    return canonical_paths
+
+
+def deduplicate_matrix_rows(rows: list[dict[str, Any]]) -> None:
+    canonical_paths = canonical_matrix_paths(rows)
+    for row in rows:
+        matrix_path = row.get("A")
+        if matrix_path in canonical_paths:
+            row["A"] = canonical_paths[matrix_path]
+
+
 def write_resolved_snapshot_collection(
     snapshot_collection_path: str | Path,
     output_path: str | Path,
+    *,
+    deduplicate_matrices: bool = True,
 ) -> Path:
     output = Path(output_path).resolve()
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -316,6 +409,8 @@ def write_resolved_snapshot_collection(
         }
         for snapshot in snapshots
     ]
+    if deduplicate_matrices:
+        deduplicate_matrix_rows(rows)
     with output.open("w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=SNAPSHOT_COLLECTION_COLUMNS)
         writer.writeheader()

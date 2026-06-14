@@ -13,10 +13,16 @@ from ksptune.snapshot_collections import (
 )
 
 
-def write_snapshot(directory: Path, solve_index: int, *, with_metadata: bool = True) -> None:
+def write_snapshot(
+    directory: Path,
+    solve_index: int,
+    *,
+    matrix_bytes: bytes = b"A",
+    with_metadata: bool = True,
+) -> None:
     prefix = "rmtest_6x5x4_trimmed_veri_nosmall"
     file_stem = f"{prefix}__solve_{solve_index:06d}"
-    (directory / f"{file_stem}__A.bin").write_bytes(b"A")
+    (directory / f"{file_stem}__A.bin").write_bytes(matrix_bytes)
     (directory / f"{file_stem}__b.bin").write_bytes(b"b")
     (directory / f"{file_stem}__x0.bin").write_bytes(b"x0")
     if with_metadata:
@@ -152,3 +158,56 @@ def test_write_resolved_snapshot_collection_uses_absolute_paths(tmp_path: Path) 
     assert Path(resolved_snapshots[0]["matrix_file_path"]).is_absolute()
     assert Path(resolved_snapshots[0]["right_hand_side_file_path"]).is_absolute()
     assert Path(resolved_snapshots[0]["initial_guess_file_path"]).is_absolute()
+
+
+def test_write_resolved_snapshot_collection_deduplicates_identical_matrices(
+    tmp_path: Path,
+) -> None:
+    dump_directory = tmp_path / "dumps"
+    dump_directory.mkdir()
+    write_snapshot(dump_directory, 0, matrix_bytes=b"same matrix")
+    write_snapshot(dump_directory, 1, matrix_bytes=b"same matrix")
+    collection_path = create_snapshot_collection_from_directory(dump_directory)
+
+    resolved_collection_path = tmp_path / "run/snapshot_collection.resolved.csv"
+    write_resolved_snapshot_collection(collection_path, resolved_collection_path)
+
+    resolved_snapshots = load_snapshot_collection(resolved_collection_path)
+    assert resolved_snapshots[0]["matrix_file_path"] == resolved_snapshots[1]["matrix_file_path"]
+    assert resolved_snapshots[0]["right_hand_side_file_path"] != resolved_snapshots[1]["right_hand_side_file_path"]
+
+
+def test_write_resolved_snapshot_collection_keeps_different_matrices(
+    tmp_path: Path,
+) -> None:
+    dump_directory = tmp_path / "dumps"
+    dump_directory.mkdir()
+    write_snapshot(dump_directory, 0, matrix_bytes=b"matrix one")
+    write_snapshot(dump_directory, 1, matrix_bytes=b"matrix two")
+    collection_path = create_snapshot_collection_from_directory(dump_directory)
+
+    resolved_collection_path = tmp_path / "run/snapshot_collection.resolved.csv"
+    write_resolved_snapshot_collection(collection_path, resolved_collection_path)
+
+    resolved_snapshots = load_snapshot_collection(resolved_collection_path)
+    assert resolved_snapshots[0]["matrix_file_path"] != resolved_snapshots[1]["matrix_file_path"]
+
+
+def test_write_resolved_snapshot_collection_can_skip_matrix_deduplication(
+    tmp_path: Path,
+) -> None:
+    dump_directory = tmp_path / "dumps"
+    dump_directory.mkdir()
+    write_snapshot(dump_directory, 0, matrix_bytes=b"same matrix")
+    write_snapshot(dump_directory, 1, matrix_bytes=b"same matrix")
+    collection_path = create_snapshot_collection_from_directory(dump_directory)
+
+    resolved_collection_path = tmp_path / "run/snapshot_collection.resolved.csv"
+    write_resolved_snapshot_collection(
+        collection_path,
+        resolved_collection_path,
+        deduplicate_matrices=False,
+    )
+
+    resolved_snapshots = load_snapshot_collection(resolved_collection_path)
+    assert resolved_snapshots[0]["matrix_file_path"] != resolved_snapshots[1]["matrix_file_path"]
