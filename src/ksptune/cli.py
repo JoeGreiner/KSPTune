@@ -20,7 +20,7 @@ from .parameter_search_spaces import (
 )
 from .petsc_options import petsc_options_to_text, render_petsc_options_from_solver_configuration
 from .snapshot_analysis import analyze_snapshots
-from .tuning_runs import BAD_COST, run_tuning
+from .tuning_runs import BAD_COST, resume_tuning, run_tuning
 
 ANSI_STYLES = {
     "bold": "\033[1m",
@@ -649,6 +649,26 @@ def cmd_tune(args: argparse.Namespace) -> int:
         run_until_stopped=run_until_stopped,
         nullspace=args.nullspace,
         nullspace_actions=args.nullspace_actions,
+        deduplicate_matrices=not args.no_deduplicate_matrices,
+        reuse_ksp_setup=not args.no_reuse_ksp_setup,
+        replay_cache_memory_mb=args.replay_cache_memory_mb,
+        force_restart=args.force_restart,
+        progress_callback=progress_callback,
+    )
+    if args.quiet:
+        print_yaml(result)
+    return 0
+
+
+def cmd_resume(args: argparse.Namespace) -> int:
+    use_color = False if args.quiet else color_enabled(args.color)
+    progress_callback = None if args.quiet else lambda event: print_tune_progress(event, color_enabled=use_color)
+    result = resume_tuning(
+        args.tuning_run,
+        trials=args.trials,
+        run_until_stopped=args.run_until_stopped,
+        workers=args.workers,
+        timeout_sec=args.timeout_sec,
         progress_callback=progress_callback,
     )
     if args.quiet:
@@ -775,6 +795,26 @@ def build_parser() -> argparse.ArgumentParser:
             "all, none, or a comma-separated list. Aliases: right=matrix, left=transpose."
         ),
     )
+    tune.add_argument(
+        "--no-deduplicate-matrices",
+        action="store_true",
+        help="Do not hash duplicate matrix candidates when writing the resolved snapshot collection.",
+    )
+    tune.add_argument(
+        "--no-reuse-ksp-setup",
+        action="store_true",
+        help="Do not reuse KSP/PC setup across snapshots with identical matrix cache keys.",
+    )
+    tune.add_argument(
+        "--replay-cache-memory-mb",
+        type=float,
+        help="Approximate total replay-server cache memory budget per worker.",
+    )
+    tune.add_argument(
+        "--force-restart",
+        action="store_true",
+        help="Overwrite an existing tuning run directory instead of refusing to replace it.",
+    )
     tune.add_argument("--seed", type=int, default=1)
     tune.add_argument("--dry-run", action="store_true")
     tune.add_argument(
@@ -790,6 +830,35 @@ def build_parser() -> argparse.ArgumentParser:
     )
     tune.add_argument("--quiet", action="store_true")
     tune.set_defaults(func=cmd_tune)
+
+    resume = subparsers.add_parser("resume")
+    resume.add_argument("tuning_run")
+    resume.add_argument(
+        "--trials",
+        type=int,
+        default=None,
+        help="Total trial target, including already completed trials.",
+    )
+    resume.add_argument(
+        "--run-until-stopped",
+        action="store_true",
+        default=None,
+        help="Continue until stopped with Ctrl+C.",
+    )
+    resume.add_argument(
+        "--workers",
+        type=int,
+        help="Override the number of parallel SMAC workers for the resumed run.",
+    )
+    resume.add_argument("--timeout-sec", type=float)
+    resume.add_argument(
+        "--color",
+        choices=["auto", "always", "never"],
+        default="auto",
+        help="Colorize resume output. Default: auto.",
+    )
+    resume.add_argument("--quiet", action="store_true")
+    resume.set_defaults(func=cmd_resume)
 
     analyze_snapshots = subparsers.add_parser(
         "analyze-snapshots",

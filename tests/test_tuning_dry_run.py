@@ -15,8 +15,10 @@ from ksptune.tuning_runs import (
     BAD_COST,
     count_tunable_hyperparameters,
     initial_solver_configuration_records_from_parameter_search_space,
+    load_trial_records,
     optimize_smac_with_known_warning_filter,
     resolve_sobol_initial_design_configuration_count,
+    resume_tuning,
     run_tuning,
 )
 
@@ -26,6 +28,94 @@ def write_minimal_snapshot(directory: Path, solve_index: int = 0) -> None:
     (directory / f"{file_stem}__A.bin").write_bytes(b"A")
     (directory / f"{file_stem}__b.bin").write_bytes(b"b")
     (directory / f"{file_stem}__x0.bin").write_bytes(b"x0")
+
+
+def write_resume_run(
+    output_directory: Path,
+    snapshot_directory: Path,
+    *,
+    replay_binary: Path,
+    trials: int | None = 3,
+    run_until_stopped: bool = False,
+    workers: int = 1,
+) -> None:
+    output_directory.mkdir()
+    snapshot_collection_path = output_directory / "snapshot_collection.csv"
+    replay_snapshot_collection_path = output_directory / "snapshot_collection.resolved.csv"
+    snapshot_collection_path.write_text("solve_index,A,b,x0\n", encoding="utf-8")
+    replay_snapshot_collection_path.write_text("solve_index,A,b,x0\n", encoding="utf-8")
+    yaml.safe_dump(
+        {
+            "snapshot_directory_path": str(snapshot_directory),
+            "snapshot_collection_path": str(snapshot_collection_path),
+            "replay_snapshot_collection_path": str(replay_snapshot_collection_path),
+            "parameter_search_space": "petsc.hypre-basic",
+            "parameter_search_space_source": "builtin:petsc.hypre-basic",
+            "replay_binary": str(replay_binary),
+            "replay_binary_auto_detected": False,
+            "mpiexec": "mpiexec",
+            "mpi_processes": 1,
+            "threads_per_rank": 1,
+            "workers": workers,
+            "trials": trials,
+            "effective_trials": 2_147_483_647 if run_until_stopped else trials,
+            "run_until_stopped": run_until_stopped,
+            "repeat": 1,
+            "warmup": 0,
+            "timeout_sec": None,
+            "objective_name": "solve_time_sec_mean",
+            "nullspace": {
+                "mode": "from-metadata",
+                "source": "from-metadata",
+                "label": "from-metadata",
+                "replay_options": ["-replay_nullspace", "from-metadata"],
+            },
+            "nullspace_actions": {
+                "mode": "default",
+                "label": "metadata",
+                "replay_options": [],
+            },
+            "deduplicate_matrices": True,
+            "reuse_ksp_setup": True,
+            "seed": 1,
+            "dry_run": False,
+        },
+        (output_directory / "tuning_run.yaml").open("w", encoding="utf-8"),
+        sort_keys=False,
+    )
+    (output_directory / "solver_configuration_trials.jsonl").write_text(
+        json.dumps(
+            {
+                "trial_number": 1,
+                "smac_configuration_tag": "old001",
+                "solver_configuration": {"ksp_type": "cg", "pc_type": "jacobi"},
+                "petsc_options": ["-ksp_type", "cg", "-pc_type", "jacobi"],
+                "objective_name": "solve_time_sec_mean",
+                "objective_value": 0.5,
+                "failure_reason": None,
+                "converged": True,
+            },
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    smac_state_directory = output_directory / "smac" / "oldsmac" / "1"
+    smac_state_directory.mkdir(parents=True)
+    (smac_state_directory / "scenario.json").write_text(
+        json.dumps(
+            {
+                "name": "oldsmac",
+                "n_trials": trials or 2_147_483_647,
+                "n_workers": workers,
+            },
+            indent=4,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    (smac_state_directory / "runhistory.json").write_text("{}", encoding="utf-8")
+    (smac_state_directory / "intensifier.json").write_text("{}", encoding="utf-8")
 
 
 def test_initial_design_helpers_count_only_tunable_hyperparameters() -> None:
@@ -111,8 +201,55 @@ def test_tuning_dry_run_writes_reproducible_files(tmp_path: Path) -> None:
     assert summary["trial_count"] == 0
     assert summary["best_trial"] is None
 
+    tuning_run = yaml.safe_load((output_directory / "tuning_run.yaml").read_text(encoding="utf-8"))
+    assert tuning_run["deduplicate_matrices"] is True
+    assert tuning_run["reuse_ksp_setup"] is True
+
     rows = list(csv.DictReader((output_directory / "solver_configuration_trials.csv").open()))
     assert rows == []
+
+
+def test_tuning_refuses_existing_run_directory_without_force_restart(tmp_path: Path) -> None:
+    dump_directory = tmp_path / "dumps"
+    dump_directory.mkdir()
+    write_minimal_snapshot(dump_directory)
+    output_directory = tmp_path / "run"
+    output_directory.mkdir()
+    (output_directory / "tuning_run.yaml").write_text("status: old\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="already contains a KSPTune run"):
+        run_tuning(
+            snapshot_directory=dump_directory,
+            parameter_search_space=load_parameter_search_space("petsc.hypre-basic"),
+            output_directory=output_directory,
+            dry_run=True,
+        )
+
+
+def test_tuning_force_restart_allows_existing_run_directory(tmp_path: Path) -> None:
+    dump_directory = tmp_path / "dumps"
+    dump_directory.mkdir()
+    write_minimal_snapshot(dump_directory)
+    output_directory = tmp_path / "run"
+    output_directory.mkdir()
+    (output_directory / "tuning_run.yaml").write_text("status: old\n", encoding="utf-8")
+    (output_directory / "solver_configuration_trials.jsonl").write_text(
+        '{"trial_number": 99}\n',
+        encoding="utf-8",
+    )
+
+    result = run_tuning(
+        snapshot_directory=dump_directory,
+        parameter_search_space=load_parameter_search_space("petsc.hypre-basic"),
+        output_directory=output_directory,
+        dry_run=True,
+        force_restart=True,
+    )
+
+    assert result["status"] == "dry-run"
+    assert (output_directory / "solver_configuration_trials.jsonl").read_text(encoding="utf-8") == ""
+    tuning_run = yaml.safe_load((output_directory / "tuning_run.yaml").read_text(encoding="utf-8"))
+    assert tuning_run["force_restart"] is True
 
 
 def test_run_until_stopped_writes_best_so_far_after_keyboard_interrupt(

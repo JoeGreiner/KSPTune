@@ -15,6 +15,7 @@ import yaml
 
 from .parameter_search_spaces import (
     get_parameter_search_space_name,
+    load_parameter_search_space,
     parameter_search_space_to_yaml,
     write_configspace_json,
     write_configspace_yaml,
@@ -25,6 +26,7 @@ from .petsc_options import (
     render_petsc_options_from_solver_configuration,
 )
 from .replay import (
+    ReplayWorkerPool,
     replay_failure_reason,
     replay_metric_summary,
     replay_objective_value,
@@ -220,6 +222,33 @@ def load_trial_records(path: str | Path) -> list[dict[str, Any]]:
     return records
 
 
+def output_directory_has_run_data(output_directory: str | Path) -> bool:
+    output_path = Path(output_directory)
+    trials_path = output_path / "solver_configuration_trials.jsonl"
+    return (
+        (output_path / "tuning_run.yaml").exists()
+        or ((output_path / "smac").exists() and any((output_path / "smac").iterdir()))
+        or (trials_path.exists() and trials_path.read_text(encoding="utf-8").strip() != "")
+    )
+
+
+def clear_restart_outputs(output_directory: str | Path) -> None:
+    output_path = Path(output_directory)
+    smac_path = output_path / "smac"
+    if smac_path.exists():
+        shutil.rmtree(smac_path)
+
+
+def max_trial_number(records: list[dict[str, Any]]) -> int:
+    trial_numbers = [
+        int(record["trial_number"])
+        for record in records
+        if isinstance(record.get("trial_number"), int)
+        or str(record.get("trial_number", "")).isdigit()
+    ]
+    return max(trial_numbers) if trial_numbers else 0
+
+
 def is_number(value: Any) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
 
@@ -238,6 +267,11 @@ def ranking_key(record: dict[str, Any]) -> tuple[int, float, int]:
     numeric_objective = float(objective_value) if is_number(objective_value) else BAD_COST
     failed = 0 if is_successful_trial(record) else 1
     return (failed, numeric_objective, int(record.get("trial_number") or 0))
+
+
+def best_record_from_trial_records(records: list[dict[str, Any]]) -> dict[str, Any] | None:
+    successful_records = [record for record in records if is_successful_trial(record)]
+    return min(successful_records, key=ranking_key) if successful_records else None
 
 
 def csv_value(value: Any) -> Any:
@@ -431,6 +465,110 @@ def resolve_replay_binary(
     return default_replay_binary, True
 
 
+def find_resume_smac_state_directory(output_directory: str | Path, seed: int) -> Path:
+    smac_path = Path(output_directory) / "smac"
+    if not smac_path.exists():
+        raise ValueError(f"No SMAC state found in {smac_path}.")
+    candidates: list[Path] = []
+    for scenario_path in smac_path.glob(f"*/{seed}/scenario.json"):
+        state_directory = scenario_path.parent
+        if (
+            (state_directory / "runhistory.json").exists()
+            and (state_directory / "intensifier.json").exists()
+        ):
+            candidates.append(state_directory)
+    if not candidates:
+        raise ValueError(f"No complete SMAC state found in {smac_path} for seed {seed}.")
+    if len(candidates) > 1:
+        candidate_text = ", ".join(str(path) for path in candidates)
+        raise ValueError(f"Multiple SMAC states found for seed {seed}: {candidate_text}")
+    return candidates[0]
+
+
+def load_yaml_mapping(path: str | Path) -> dict[str, Any]:
+    data = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError(f"{path} must contain a YAML mapping.")
+    return data
+
+
+def load_json_mapping(path: str | Path) -> dict[str, Any]:
+    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    if not isinstance(data, dict):
+        raise ValueError(f"{path} must contain a JSON object.")
+    return data
+
+
+def write_json_mapping(path: str | Path, data: dict[str, Any]) -> None:
+    output_path = Path(path)
+    output_path.write_text(json.dumps(data, indent=4, allow_nan=True) + "\n", encoding="utf-8")
+
+
+def normalize_resume_smac_scenario(
+    smac_state_directory: str | Path,
+    *,
+    effective_trials: int,
+    workers: int,
+) -> dict[str, Any]:
+    scenario_path = Path(smac_state_directory) / "scenario.json"
+    scenario_data = load_json_mapping(scenario_path)
+    scenario_data["n_trials"] = effective_trials
+    scenario_data["n_workers"] = workers
+    write_json_mapping(scenario_path, scenario_data)
+    return scenario_data
+
+
+def parameter_search_space_reference(tuning_run: dict[str, Any]) -> str:
+    source = tuning_run.get("parameter_search_space_source")
+    if isinstance(source, str) and source.startswith("builtin:"):
+        return source.removeprefix("builtin:")
+    if source:
+        return str(source)
+    parameter_search_space = tuning_run.get("parameter_search_space")
+    if parameter_search_space:
+        return str(parameter_search_space)
+    raise ValueError("Cannot resume: tuning_run.yaml does not name a parameter search space.")
+
+
+def resolve_resume_replay_binary(tuning_run: dict[str, Any]) -> str | Path | None:
+    replay_binary = tuning_run.get("replay_binary")
+    if tuning_run.get("replay_binary_auto_detected"):
+        return None
+    if replay_binary is None:
+        return None
+    replay_binary_path = Path(str(replay_binary))
+    if not replay_binary_path.exists():
+        raise ValueError(f"Cannot resume: replay binary no longer exists: {replay_binary_path}")
+    return replay_binary_path
+
+
+def nullspace_argument_from_configuration(configuration: dict[str, Any] | None) -> str | None:
+    if not configuration:
+        return "from-metadata"
+    mode = configuration.get("mode")
+    if mode in {"from-metadata", "none", "constant"}:
+        return str(mode)
+    if mode == "field":
+        field_index = configuration.get("field_index")
+        block_size = configuration.get("block_size", 2)
+        return f"field:{field_index},block_size={block_size}"
+    return str(configuration.get("label") or "from-metadata")
+
+
+def nullspace_actions_argument_from_configuration(configuration: dict[str, Any] | None) -> str | None:
+    if not configuration or configuration.get("mode") == "default":
+        return None
+    return str(configuration.get("label") or configuration.get("mode"))
+
+
+def resume_timeout_value(tuning_run: dict[str, Any], override: float | None) -> float | None:
+    if override is not None:
+        return override
+    if "timeout_sec" in tuning_run:
+        return tuning_run.get("timeout_sec")
+    return tuning_run.get("timeout_seconds")
+
+
 def write_solver_configuration_outputs(
     *,
     output_directory: str | Path,
@@ -456,6 +594,7 @@ def run_tuning(
     output_directory: str | Path,
     replay_binary: str | Path | None = None,
     mpiexec: str = "mpiexec",
+    mpiexec_args: list[str] | None = None,
     mpi_processes: int = 1,
     threads_per_rank: int = 1,
     workers: int = 1,
@@ -469,13 +608,34 @@ def run_tuning(
     run_until_stopped: bool = False,
     nullspace: str | None = "from-metadata",
     nullspace_actions: str | None = None,
+    deduplicate_matrices: bool = True,
+    reuse_ksp_setup: bool = True,
+    replay_cache_memory_mb: float | None = None,
+    force_restart: bool = False,
+    resume: bool = False,
+    resume_smac_name: str | None = None,
+    snapshot_collection_path_override: str | Path | None = None,
+    replay_snapshot_collection_path_override: str | Path | None = None,
+    existing_trial_records: list[dict[str, Any]] | None = None,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     if workers < 1:
         raise ValueError("workers must be at least 1.")
+    if resume and force_restart:
+        raise ValueError("resume and force_restart cannot be used together.")
+    resolved_mpiexec_args = list(mpiexec_args or [])
 
     output_path = Path(output_directory).resolve()
     output_path.mkdir(parents=True, exist_ok=True)
+    if not resume and output_directory_has_run_data(output_path):
+        if not force_restart:
+            raise ValueError(
+                f"{output_path} already contains a KSPTune run. "
+                "Use `ksptune resume RUN_DIR` to continue it or pass "
+                "`--force-restart` to overwrite it."
+            )
+        clear_restart_outputs(output_path)
+
     if run_until_stopped:
         effective_trials = RUN_UNTIL_STOPPED_TRIAL_LIMIT
     else:
@@ -498,15 +658,32 @@ def run_tuning(
 
     snapshot_directory_path = Path(snapshot_directory).resolve()
     snapshot_summary = summarize_snapshot_directory(snapshot_directory_path)
-    snapshot_collection_path = create_snapshot_collection_from_directory(
-        snapshot_directory_path,
-        output_path / "snapshot_collection.csv",
-        overwrite=True,
-    )
-    replay_snapshot_collection_path = write_resolved_snapshot_collection(
-        snapshot_collection_path,
-        output_path / "snapshot_collection.resolved.csv",
-    )
+    if resume:
+        snapshot_collection_path = Path(
+            snapshot_collection_path_override or output_path / "snapshot_collection.csv"
+        ).resolve()
+        replay_snapshot_collection_path = Path(
+            replay_snapshot_collection_path_override
+            or output_path / "snapshot_collection.resolved.csv"
+        ).resolve()
+        if not snapshot_collection_path.exists():
+            raise ValueError(f"Cannot resume: snapshot collection not found: {snapshot_collection_path}")
+        if not replay_snapshot_collection_path.exists():
+            raise ValueError(
+                "Cannot resume: resolved snapshot collection not found: "
+                f"{replay_snapshot_collection_path}"
+            )
+    else:
+        snapshot_collection_path = create_snapshot_collection_from_directory(
+            snapshot_directory_path,
+            output_path / "snapshot_collection.csv",
+            overwrite=True,
+        )
+        replay_snapshot_collection_path = write_resolved_snapshot_collection(
+            snapshot_collection_path,
+            output_path / "snapshot_collection.resolved.csv",
+            deduplicate_matrices=deduplicate_matrices,
+        )
     configuration_space = parameter_search_space
 
     use_default_solver_configuration = True
@@ -549,6 +726,8 @@ def run_tuning(
             ),
             "replay_binary": str(replay_binary_path) if replay_binary_path else None,
             "replay_binary_auto_detected": replay_binary_auto_detected,
+            "mpiexec": mpiexec,
+            "mpiexec_args": resolved_mpiexec_args,
             "mpi_processes": mpi_processes,
             "threads_per_rank": threads_per_rank,
             "workers": workers,
@@ -561,6 +740,12 @@ def run_tuning(
             "objective_name": objective_name,
             "nullspace": nullspace_configuration,
             "nullspace_actions": nullspace_action_configuration,
+            "deduplicate_matrices": deduplicate_matrices,
+            "reuse_ksp_setup": reuse_ksp_setup,
+            "replay_cache_memory_mb": replay_cache_memory_mb,
+            "resume": resume,
+            "force_restart": force_restart,
+            "resumed_completed_trials": max_trial_number(existing_trial_records or []),
             "failed_replay_objective_value": BAD_COST,
             "smac_deterministic": True,
             "use_default_solver_configuration": use_default_solver_configuration,
@@ -585,8 +770,12 @@ def run_tuning(
     parameter_search_space_name = get_parameter_search_space_name(parameter_search_space)
     output_paths = tuning_output_paths(output_path)
     trials_path = output_path / "solver_configuration_trials.jsonl"
-    trials_path.write_text("", encoding="utf-8")
-    remove_best_solver_configuration_outputs(output_path)
+    if resume:
+        trials_path.touch(exist_ok=True)
+    else:
+        trials_path.write_text("", encoding="utf-8")
+        remove_best_solver_configuration_outputs(output_path)
+    completed_trial_count = max_trial_number(existing_trial_records or [])
     emit_progress(
         progress_callback,
         {
@@ -599,6 +788,8 @@ def run_tuning(
             "output_directory": str(output_path),
             "replay_binary": str(replay_binary_path.resolve()) if replay_binary_path else None,
             "replay_binary_auto_detected": replay_binary_auto_detected,
+            "mpiexec": mpiexec,
+            "mpiexec_args": resolved_mpiexec_args,
             "mpi_processes": mpi_processes,
             "threads_per_rank": threads_per_rank,
             "workers": workers,
@@ -618,6 +809,17 @@ def run_tuning(
             "additionalinitial_solver_configurations": additionalinitial_solver_configuration_labels,
             "nullspace_configuration": nullspace_configuration,
             "nullspace_action_configuration": nullspace_action_configuration,
+            "deduplicate_matrices": deduplicate_matrices,
+            "reuse_ksp_setup": reuse_ksp_setup,
+            "replay_cache_memory_mb": replay_cache_memory_mb,
+            "resume": resume,
+            "force_restart": force_restart,
+            "completed_trials": completed_trial_count,
+            "remaining_trials": (
+                None
+                if run_until_stopped
+                else max(0, int(effective_trials) - int(completed_trial_count))
+            ),
             "dry_run": dry_run,
         },
     )
@@ -648,13 +850,64 @@ def run_tuning(
 
     from smac import HyperparameterOptimizationFacade, Scenario
 
-    completed_trial_counter = {"value": 0}
+    completed_trial_counter = {"value": completed_trial_count}
     best = {
         "cost": math.inf,
         "solver_configuration": None,
         "trial_number": None,
         "smac_configuration_tag": None,
     }
+    existing_best_record = best_record_from_trial_records(existing_trial_records or [])
+    if existing_best_record is not None:
+        best["cost"] = float(existing_best_record["objective_value"])
+        best["solver_configuration"] = existing_best_record.get("solver_configuration")
+        best["trial_number"] = existing_best_record.get("trial_number")
+        best["smac_configuration_tag"] = existing_best_record.get("smac_configuration_tag")
+        if best["solver_configuration"] is not None:
+            write_solver_configuration_outputs(
+                output_directory=output_path,
+                parameter_search_space=parameter_search_space,
+                solver_configuration=best["solver_configuration"],
+            )
+
+    if resume and not run_until_stopped and completed_trial_count >= effective_trials:
+        summary = write_tuning_summary_outputs(
+            output_directory=output_path,
+            objective_name=objective_name,
+            status="completed",
+        )
+        best_trial = summary.get("best_trial") or {}
+        best_solver_configuration = best_trial.get("solver_configuration")
+        if best_solver_configuration is not None:
+            write_solver_configuration_outputs(
+                output_directory=output_path,
+                parameter_search_space=parameter_search_space,
+                solver_configuration=best_solver_configuration,
+            )
+        result = {
+            "status": "completed",
+            "output_directory": str(output_path),
+            "stopped_by_user": False,
+            "best_cost": best_trial.get("objective_value"),
+            "best_solver_configuration": best_solver_configuration,
+            "best_petsc_options": best_trial.get("petsc_options"),
+            "summary": summary,
+            **output_paths,
+        }
+        emit_progress(progress_callback, {"event": "run_finished", **result})
+        return result
+
+    replay_worker_pool = ReplayWorkerPool(
+        replay_binary=replay_binary_path,
+        snapshot_collection_path=replay_snapshot_collection_path,
+        workers=workers,
+        mpiexec=mpiexec,
+        mpiexec_args=resolved_mpiexec_args,
+        mpi_processes=mpi_processes,
+        threads_per_rank=threads_per_rank,
+        extra_replay_options=nullspace_replay_options,
+        cache_memory_mb=replay_cache_memory_mb,
+    )
 
     def best_so_far_progress_fields() -> dict[str, Any]:
         if math.isinf(float(best["cost"])):
@@ -794,16 +1047,19 @@ def run_tuning(
         }
         return cost, {"ksptune_trial_record": record}
 
-    scenario = Scenario(
-        configspace=configuration_space,
-        output_directory=output_path / "smac",
-        n_trials=effective_trials,
-        seed=seed,
-        deterministic=True,
-        crash_cost=BAD_COST,
-        n_workers=workers,
-        use_default_config=use_default_solver_configuration,
-    )
+    scenario_kwargs = {
+        "configspace": configuration_space,
+        "output_directory": output_path / "smac",
+        "n_trials": effective_trials,
+        "seed": seed,
+        "deterministic": True,
+        "crash_cost": BAD_COST,
+        "n_workers": workers,
+        "use_default_config": use_default_solver_configuration,
+    }
+    if resume_smac_name is not None:
+        scenario_kwargs["name"] = resume_smac_name
+    scenario = Scenario(**scenario_kwargs)
     initial_design = HyperparameterOptimizationFacade.get_initial_design(
         scenario,
         n_configs=sobol_initial_design_configurations,
@@ -817,7 +1073,7 @@ def run_tuning(
         target_function=target_function,
         callbacks=[KSPTuneProgressCallback()],
         initial_design=initial_design,
-        overwrite=True,
+        overwrite=not resume,
     )
     status = "completed"
     try:
@@ -833,6 +1089,7 @@ def run_tuning(
             },
         )
     finally:
+        replay_worker_pool.close()
         close_smac_runner(smac)
     summary = write_tuning_summary_outputs(
         output_directory=output_path,
@@ -859,3 +1116,93 @@ def run_tuning(
     }
     emit_progress(progress_callback, {"event": "run_finished", **result})
     return result
+
+
+def resume_tuning(
+    tuning_run_directory: str | Path,
+    *,
+    trials: int | None = None,
+    run_until_stopped: bool | None = None,
+    workers: int | None = None,
+    timeout_sec: float | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    output_path = Path(tuning_run_directory).resolve()
+    tuning_run_path = output_path / "tuning_run.yaml"
+    trials_path = output_path / "solver_configuration_trials.jsonl"
+    if not tuning_run_path.exists():
+        raise ValueError(f"Cannot resume: tuning_run.yaml not found in {output_path}.")
+    if not trials_path.exists():
+        raise ValueError(
+            f"Cannot resume: solver_configuration_trials.jsonl not found in {output_path}."
+        )
+
+    tuning_run = load_yaml_mapping(tuning_run_path)
+    if tuning_run.get("dry_run"):
+        raise ValueError("Cannot resume a dry-run tuning directory.")
+
+    seed = int(tuning_run.get("seed", 1))
+    smac_state_directory = find_resume_smac_state_directory(output_path, seed)
+
+    old_run_until_stopped = bool(tuning_run.get("run_until_stopped", False))
+    if run_until_stopped is None:
+        resolved_run_until_stopped = old_run_until_stopped if trials is None else False
+    else:
+        resolved_run_until_stopped = run_until_stopped
+    resolved_trials = tuning_run.get("trials") if trials is None else trials
+    if not resolved_run_until_stopped and resolved_trials is None:
+        raise ValueError("Cannot resume with a fixed trial budget because the trial count is unknown.")
+    effective_trials = (
+        RUN_UNTIL_STOPPED_TRIAL_LIMIT
+        if resolved_run_until_stopped
+        else int(resolved_trials)
+    )
+    resolved_workers = int(workers if workers is not None else tuning_run.get("workers", 1))
+
+    scenario_data = normalize_resume_smac_scenario(
+        smac_state_directory,
+        effective_trials=effective_trials,
+        workers=resolved_workers,
+    )
+    smac_name = str(scenario_data.get("name") or smac_state_directory.parent.name)
+
+    parameter_search_space = load_parameter_search_space(
+        parameter_search_space_reference(tuning_run),
+        seed=seed,
+    )
+    existing_records = load_trial_records(trials_path)
+
+    return run_tuning(
+        snapshot_directory=tuning_run["snapshot_directory_path"],
+        parameter_search_space=parameter_search_space,
+        output_directory=output_path,
+        replay_binary=resolve_resume_replay_binary(tuning_run),
+        mpiexec=str(tuning_run.get("mpiexec") or "mpiexec"),
+        mpiexec_args=list(tuning_run.get("mpiexec_args") or []),
+        mpi_processes=int(tuning_run.get("mpi_processes", 1)),
+        threads_per_rank=int(tuning_run.get("threads_per_rank", 1)),
+        workers=resolved_workers,
+        trials=resolved_trials,
+        repeat=int(tuning_run.get("repeat", 1)),
+        warmup=int(tuning_run.get("warmup", 0)),
+        timeout_sec=resume_timeout_value(tuning_run, timeout_sec),
+        objective_name=str(tuning_run.get("objective_name") or "solve_time_sec_mean"),
+        seed=seed,
+        dry_run=False,
+        run_until_stopped=resolved_run_until_stopped,
+        nullspace=nullspace_argument_from_configuration(tuning_run.get("nullspace")),
+        nullspace_actions=nullspace_actions_argument_from_configuration(
+            tuning_run.get("nullspace_actions")
+        ),
+        deduplicate_matrices=bool(tuning_run.get("deduplicate_matrices", True)),
+        reuse_ksp_setup=bool(tuning_run.get("reuse_ksp_setup", True)),
+        replay_cache_memory_mb=tuning_run.get("replay_cache_memory_mb"),
+        resume=True,
+        resume_smac_name=smac_name,
+        snapshot_collection_path_override=tuning_run.get("snapshot_collection_path"),
+        replay_snapshot_collection_path_override=tuning_run.get(
+            "replay_snapshot_collection_path"
+        ),
+        existing_trial_records=existing_records,
+        progress_callback=progress_callback,
+    )

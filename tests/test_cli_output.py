@@ -53,6 +53,46 @@ def test_tune_parser_accepts_run_until_stopped_mode() -> None:
     assert args.run_until_stopped is True
 
 
+def test_tune_parser_accepts_force_restart() -> None:
+    args = build_parser().parse_args(
+        [
+            "tune",
+            "--snapshot-directory",
+            "snapshots.csv",
+            "--parameter-search-space",
+            "petsc.hypre-basic",
+            "--output-directory",
+            "run",
+            "--force-restart",
+        ]
+    )
+
+    assert args.force_restart is True
+
+
+def test_resume_parser_accepts_runtime_overrides() -> None:
+    args = build_parser().parse_args(
+        [
+            "resume",
+            "run",
+            "--trials",
+            "200",
+            "--workers",
+            "4",
+            "--timeout-sec",
+            "180",
+            "--quiet",
+        ]
+    )
+
+    assert args.tuning_run == "run"
+    assert args.trials == 200
+    assert args.workers == 4
+    assert args.timeout_sec == 180
+    assert args.run_until_stopped is None
+    assert args.quiet is True
+
+
 def test_tune_parser_accepts_color_and_worker_mode() -> None:
     args = build_parser().parse_args(
         [
