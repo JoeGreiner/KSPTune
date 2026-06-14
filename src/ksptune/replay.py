@@ -3,8 +3,13 @@ from __future__ import annotations
 import json
 import math
 import os
+import queue
+import selectors
 import subprocess
+import tempfile
+import threading
 import time
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -24,7 +29,16 @@ NUMERIC_REPLAY_RESULT_FIELDS = {
     "objective_time_sec_median",
     "total_wall_time_sec",
     "matrix_load_time_sec",
+    "matrix_cache_hits",
+    "matrix_cache_misses",
+    "replay_cache_memory_mb",
+    "replay_cache_memory_limit_mb",
+    "replay_cache_evictions",
     "solver_setup_time_sec",
+    "solver_setup_time_sec_actual",
+    "solver_setup_time_sec_logical",
+    "ksp_setup_cache_hits",
+    "ksp_setup_cache_misses",
     "solve_time_sec_total",
     "solve_time_sec_mean",
     "solve_time_sec_median",
@@ -32,6 +46,10 @@ NUMERIC_REPLAY_RESULT_FIELDS = {
     "solve_time_sec_max",
     "solve_time_sec_stddev",
     "solve_time_sec_range",
+    "solve_mpi_message_count",
+    "solve_mpi_message_bytes",
+    "solve_mpi_message_bytes_mean",
+    "solve_mpi_reduction_count",
     "iterations_total",
     "initial_true_residual_norm_mean",
     "initial_true_relative_residual_mean",
@@ -64,6 +82,7 @@ def build_replay_command(
     replay_result_path: str | Path,
     petsc_options: list[str],
     mpiexec: str = "mpiexec",
+    mpiexec_args: list[str] | None = None,
     mpi_processes: int = 1,
     repeat: int = 1,
     warmup: int = 0,
@@ -85,7 +104,36 @@ def build_replay_command(
     replay_command.extend(petsc_options)
 
     if mpi_processes > 1:
-        return [mpiexec, "-n", str(mpi_processes), *replay_command]
+        return [mpiexec, *(mpiexec_args or []), "-n", str(mpi_processes), *replay_command]
+    if mpiexec_args:
+        return [mpiexec, *mpiexec_args, *replay_command]
+    return replay_command
+
+
+def build_replay_server_command(
+    *,
+    replay_binary: str | Path,
+    snapshot_collection_path: str | Path,
+    mpiexec: str = "mpiexec",
+    mpiexec_args: list[str] | None = None,
+    mpi_processes: int = 1,
+    extra_replay_options: list[str] | None = None,
+    cache_memory_mb: float | None = None,
+) -> list[str]:
+    replay_command = [
+        str(replay_binary),
+        "-replay_server",
+        "-snapshot_collection",
+        str(snapshot_collection_path),
+    ]
+    if cache_memory_mb is not None:
+        replay_command.extend(["-replay_cache_memory_mb", str(cache_memory_mb)])
+    if extra_replay_options:
+        replay_command.extend(extra_replay_options)
+    if mpi_processes > 1:
+        return [mpiexec, *(mpiexec_args or []), "-n", str(mpi_processes), *replay_command]
+    if mpiexec_args:
+        return [mpiexec, *mpiexec_args, *replay_command]
     return replay_command
 
 
@@ -219,7 +267,16 @@ def replay_metric_summary(replay_result: dict[str, Any]) -> dict[str, Any]:
     metric_names = [
         "total_wall_time_sec",
         "matrix_load_time_sec",
+        "matrix_cache_hits",
+        "matrix_cache_misses",
+        "replay_cache_memory_mb",
+        "replay_cache_memory_limit_mb",
+        "replay_cache_evictions",
         "solver_setup_time_sec",
+        "solver_setup_time_sec_actual",
+        "solver_setup_time_sec_logical",
+        "ksp_setup_cache_hits",
+        "ksp_setup_cache_misses",
         "solve_time_sec_total",
         "solve_time_sec_mean",
         "solve_time_sec_median",
@@ -227,6 +284,10 @@ def replay_metric_summary(replay_result: dict[str, Any]) -> dict[str, Any]:
         "solve_time_sec_max",
         "solve_time_sec_stddev",
         "solve_time_sec_range",
+        "solve_mpi_message_count",
+        "solve_mpi_message_bytes",
+        "solve_mpi_message_bytes_mean",
+        "solve_mpi_reduction_count",
         "iterations_total",
         "iterations_median",
         "peak_memory_mb_max_per_rank",
@@ -310,6 +371,22 @@ def replay_metric_summary(replay_result: dict[str, Any]) -> dict[str, Any]:
     return summary
 
 
+def read_replay_result_file(result_path: Path) -> tuple[dict[str, Any], list[str]]:
+    replay_result: dict[str, Any] = {}
+    schema_errors: list[str] = []
+    if result_path.exists():
+        try:
+            replay_result = json.loads(result_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError as exc:
+            schema_errors.append(f"invalid replay JSON: {exc}")
+    else:
+        schema_errors.append(f"missing replay JSON: {result_path}")
+
+    if replay_result:
+        schema_errors.extend(validate_replay_result(replay_result))
+    return replay_result, schema_errors
+
+
 def run_replay_for_solver_configuration(
     *,
     replay_binary: str | Path,
@@ -317,6 +394,7 @@ def run_replay_for_solver_configuration(
     replay_result_path: str | Path,
     petsc_options: list[str],
     mpiexec: str = "mpiexec",
+    mpiexec_args: list[str] | None = None,
     mpi_processes: int = 1,
     repeat: int = 1,
     warmup: int = 0,
@@ -332,6 +410,7 @@ def run_replay_for_solver_configuration(
         replay_result_path=result_path,
         petsc_options=petsc_options,
         mpiexec=mpiexec,
+        mpiexec_args=mpiexec_args,
         mpi_processes=mpi_processes,
         repeat=repeat,
         warmup=warmup,
@@ -383,3 +462,258 @@ def run_replay_for_solver_configuration(
         "schema_errors": schema_errors,
         "failure_reason": failure_reason,
     }
+
+
+class ReplayServerProcess:
+    def __init__(
+        self,
+        *,
+        replay_binary: str | Path,
+        snapshot_collection_path: str | Path,
+        mpiexec: str = "mpiexec",
+        mpiexec_args: list[str] | None = None,
+        mpi_processes: int = 1,
+        threads_per_rank: int = 1,
+        extra_replay_options: list[str] | None = None,
+        cache_memory_mb: float | None = None,
+    ) -> None:
+        self.command = build_replay_server_command(
+            replay_binary=replay_binary,
+            snapshot_collection_path=snapshot_collection_path,
+            mpiexec=mpiexec,
+            mpiexec_args=mpiexec_args,
+            mpi_processes=mpi_processes,
+            extra_replay_options=extra_replay_options,
+            cache_memory_mb=cache_memory_mb,
+        )
+        self.threads_per_rank = threads_per_rank
+        self.process: subprocess.Popen[str] | None = None
+        self.stderr_file = None
+        self.stderr_path: Path | None = None
+        self.lock = threading.Lock()
+
+    def start(self) -> None:
+        if self.process is not None and self.process.poll() is None:
+            return
+        self.close(kill=True)
+        stderr_file = tempfile.NamedTemporaryFile(
+            mode="w+",
+            encoding="utf-8",
+            prefix="ksptune-replay-server-",
+            suffix=".stderr",
+            delete=False,
+        )
+        self.stderr_file = stderr_file
+        self.stderr_path = Path(stderr_file.name)
+        self.process = subprocess.Popen(
+            self.command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=stderr_file,
+            text=True,
+            bufsize=1,
+            env=replay_environment(self.threads_per_rank),
+        )
+
+    def stderr_text(self) -> str:
+        if self.stderr_file is not None:
+            self.stderr_file.flush()
+        if self.stderr_path is None or not self.stderr_path.exists():
+            return ""
+        return self.stderr_path.read_text(encoding="utf-8", errors="replace")
+
+    def close(self, *, kill: bool = False, timeout_sec: float = 2.0) -> None:
+        process = self.process
+        self.process = None
+        if process is not None and process.poll() is None:
+            if kill:
+                process.kill()
+                try:
+                    process.wait(timeout=timeout_sec)
+                except subprocess.TimeoutExpired:
+                    pass
+            else:
+                try:
+                    if process.stdin is not None:
+                        process.stdin.write(
+                            json.dumps(
+                                {"id": f"shutdown-{uuid.uuid4().hex}", "command": "shutdown"}
+                            )
+                            + "\n"
+                        )
+                        process.stdin.flush()
+                    process.wait(timeout=timeout_sec)
+                except (BrokenPipeError, subprocess.TimeoutExpired):
+                    process.kill()
+                    process.wait(timeout=timeout_sec)
+        if self.stderr_file is not None:
+            self.stderr_file.close()
+            self.stderr_file = None
+
+    def _read_response_line(self, timeout_sec: float | None) -> str | None:
+        process = self.process
+        if process is None or process.stdout is None:
+            return None
+        selector = selectors.DefaultSelector()
+        selector.register(process.stdout, selectors.EVENT_READ)
+        try:
+            events = selector.select(timeout_sec)
+            if not events:
+                return None
+            return process.stdout.readline()
+        finally:
+            selector.close()
+
+    def run_solver_configuration(
+        self,
+        *,
+        replay_result_path: str | Path,
+        petsc_options: list[str],
+        repeat: int = 1,
+        warmup: int = 0,
+        timeout_sec: float | None = None,
+        reproduction_command: list[str],
+    ) -> dict[str, Any]:
+        with self.lock:
+            result_path = Path(replay_result_path)
+            result_path.parent.mkdir(parents=True, exist_ok=True)
+            request_id = uuid.uuid4().hex
+            request = {
+                "id": request_id,
+                "replay_json_out": str(result_path),
+                "petsc_options": list(petsc_options),
+                "repeat": repeat,
+                "warmup": warmup,
+            }
+
+            start_time = time.perf_counter()
+            failure_reason: str | None = None
+            returncode: int | None = None
+            response: dict[str, Any] = {}
+            stdout = ""
+            stderr = ""
+            try:
+                self.start()
+                assert self.process is not None
+                if self.process.stdin is None:
+                    raise BrokenPipeError("replay server stdin is closed")
+                self.process.stdin.write(json.dumps(request) + "\n")
+                self.process.stdin.flush()
+                response_line = self._read_response_line(timeout_sec)
+                if not response_line:
+                    failure_reason = f"replay server timed out after {timeout_sec} seconds"
+                    self.close(kill=True)
+                else:
+                    stdout = response_line
+                    response = json.loads(response_line)
+                    returncode = int(response.get("returncode", 1))
+                    failure_reason = response.get("failure_reason")
+            except (BrokenPipeError, OSError) as exc:
+                failure_reason = f"replay server exited before completing request: {exc}"
+                self.close(kill=True)
+            except json.JSONDecodeError as exc:
+                failure_reason = f"invalid replay server response: {exc}"
+                self.close(kill=True)
+
+            subprocess_wall_time_sec = time.perf_counter() - start_time
+            if returncode is None and self.process is not None:
+                returncode = self.process.poll()
+            stderr = self.stderr_text()
+            replay_result, schema_errors = read_replay_result_file(result_path)
+            if failure_reason and not replay_result and "missing replay JSON" in "; ".join(schema_errors):
+                schema_errors = []
+
+            return {
+                "command": reproduction_command,
+                "replay_server_command": self.command,
+                "replay_mode": "server",
+                "returncode": returncode,
+                "stdout": stdout,
+                "stderr": stderr,
+                "subprocess_wall_time_sec": subprocess_wall_time_sec,
+                "replay_result_path": str(result_path),
+                "replay_result": replay_result,
+                "schema_errors": schema_errors,
+                "failure_reason": failure_reason,
+                "replay_server_response": response,
+            }
+
+
+class ReplayWorkerPool:
+    def __init__(
+        self,
+        *,
+        replay_binary: str | Path,
+        snapshot_collection_path: str | Path,
+        workers: int,
+        mpiexec: str = "mpiexec",
+        mpiexec_args: list[str] | None = None,
+        mpi_processes: int = 1,
+        threads_per_rank: int = 1,
+        extra_replay_options: list[str] | None = None,
+        cache_memory_mb: float | None = None,
+    ) -> None:
+        self.workers: list[ReplayServerProcess] = [
+            ReplayServerProcess(
+                replay_binary=replay_binary,
+                snapshot_collection_path=snapshot_collection_path,
+                mpiexec=mpiexec,
+                mpiexec_args=mpiexec_args,
+                mpi_processes=mpi_processes,
+                threads_per_rank=threads_per_rank,
+                extra_replay_options=extra_replay_options,
+                cache_memory_mb=cache_memory_mb,
+            )
+            for _ in range(max(1, workers))
+        ]
+        self.available: queue.Queue[ReplayServerProcess] = queue.Queue()
+        for worker in self.workers:
+            self.available.put(worker)
+
+    def close(self) -> None:
+        for worker in self.workers:
+            worker.close()
+
+    def run_solver_configuration(self, **kwargs: Any) -> dict[str, Any]:
+        worker = self.available.get()
+        try:
+            return worker.run_solver_configuration(**kwargs)
+        finally:
+            self.available.put(worker)
+
+
+def run_replay_server_for_solver_configuration(
+    *,
+    replay_worker_pool: ReplayWorkerPool,
+    replay_binary: str | Path,
+    snapshot_collection_path: str | Path,
+    replay_result_path: str | Path,
+    petsc_options: list[str],
+    mpiexec: str = "mpiexec",
+    mpiexec_args: list[str] | None = None,
+    mpi_processes: int = 1,
+    repeat: int = 1,
+    warmup: int = 0,
+    timeout_sec: float | None = None,
+    extra_replay_options: list[str] | None = None,
+) -> dict[str, Any]:
+    reproduction_command = build_replay_command(
+        replay_binary=replay_binary,
+        snapshot_collection_path=snapshot_collection_path,
+        replay_result_path=replay_result_path,
+        petsc_options=petsc_options,
+        mpiexec=mpiexec,
+        mpiexec_args=mpiexec_args,
+        mpi_processes=mpi_processes,
+        repeat=repeat,
+        warmup=warmup,
+        extra_replay_options=extra_replay_options,
+    )
+    return replay_worker_pool.run_solver_configuration(
+        replay_result_path=replay_result_path,
+        petsc_options=petsc_options,
+        repeat=repeat,
+        warmup=warmup,
+        timeout_sec=timeout_sec,
+        reproduction_command=reproduction_command,
+    )
