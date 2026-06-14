@@ -32,6 +32,68 @@ def test_tune_parser_accepts_quiet_mode() -> None:
     assert args.color == "auto"
     assert args.workers == 1
     assert args.nullspace == "from-metadata"
+    assert args.no_deduplicate_matrices is False
+    assert args.no_reuse_ksp_setup is False
+    assert args.mpiexec_arg == []
+    assert args.replay_cache_memory_mb is None
+
+
+def test_tune_parser_accepts_launcher_args_and_replay_cache_budget() -> None:
+    args = build_parser().parse_args(
+        [
+            "tune",
+            "--snapshot-directory",
+            "snapshots.csv",
+            "--parameter-search-space",
+            "petsc.hypre-basic",
+            "--output-directory",
+            "run",
+            "--mpiexec",
+            "srun",
+            "--mpiexec-arg=--exclusive",
+            "--mpiexec-arg=--cpu-bind=cores",
+            "--replay-cache-memory-mb",
+            "4096",
+        ]
+    )
+
+    assert args.mpiexec == "srun"
+    assert args.mpiexec_arg == ["--exclusive", "--cpu-bind=cores"]
+    assert args.replay_cache_memory_mb == 4096
+
+
+def test_tune_parser_accepts_matrix_deduplication_opt_out() -> None:
+    args = build_parser().parse_args(
+        [
+            "tune",
+            "--snapshot-directory",
+            "snapshots.csv",
+            "--parameter-search-space",
+            "petsc.hypre-basic",
+            "--output-directory",
+            "run",
+            "--no-deduplicate-matrices",
+        ]
+    )
+
+    assert args.no_deduplicate_matrices is True
+
+
+def test_tune_parser_accepts_ksp_setup_reuse_opt_out() -> None:
+    args = build_parser().parse_args(
+        [
+            "tune",
+            "--snapshot-directory",
+            "snapshots.csv",
+            "--parameter-search-space",
+            "petsc.hypre-basic",
+            "--output-directory",
+            "run",
+            "--no-reuse-ksp-setup",
+        ]
+    )
+
+    assert args.no_reuse_ksp_setup is True
 
 
 def test_tune_parser_accepts_run_until_stopped_mode() -> None:
@@ -225,6 +287,11 @@ def test_tune_command_runs_until_stopped_by_default(monkeypatch) -> None:
     assert cli_module.cmd_tune(args) == 0
     assert captured["trials"] is None
     assert captured["run_until_stopped"] is True
+    assert captured["deduplicate_matrices"] is True
+    assert captured["reuse_ksp_setup"] is True
+    assert captured["mpiexec_args"] == []
+    assert captured["replay_cache_memory_mb"] is None
+    assert captured["force_restart"] is False
 
 
 def test_tune_command_uses_fixed_trials_when_requested(monkeypatch) -> None:
@@ -261,6 +328,160 @@ def test_tune_command_uses_fixed_trials_when_requested(monkeypatch) -> None:
     assert captured["workers"] == 4
     assert captured["nullspace"] == "field:1,block_size=2"
     assert captured["run_until_stopped"] is False
+    assert captured["deduplicate_matrices"] is True
+    assert captured["reuse_ksp_setup"] is True
+    assert captured["force_restart"] is False
+
+
+def test_tune_command_forwards_matrix_deduplication_opt_out(monkeypatch) -> None:
+    captured = {}
+    args = build_parser().parse_args(
+        [
+            "tune",
+            "--snapshot-directory",
+            "snapshots.csv",
+            "--parameter-search-space",
+            "petsc.hypre-basic",
+            "--output-directory",
+            "run",
+            "--no-deduplicate-matrices",
+            "--quiet",
+        ]
+    )
+
+    monkeypatch.setattr(cli_module, "load_parameter_search_space", lambda name, seed: "space")
+
+    def fake_run_tuning(**kwargs):
+        captured.update(kwargs)
+        return {"status": "completed"}
+
+    monkeypatch.setattr(cli_module, "run_tuning", fake_run_tuning)
+
+    assert cli_module.cmd_tune(args) == 0
+    assert captured["deduplicate_matrices"] is False
+
+
+def test_tune_command_forwards_ksp_setup_reuse_opt_out(monkeypatch) -> None:
+    captured = {}
+    args = build_parser().parse_args(
+        [
+            "tune",
+            "--snapshot-directory",
+            "snapshots.csv",
+            "--parameter-search-space",
+            "petsc.hypre-basic",
+            "--output-directory",
+            "run",
+            "--no-reuse-ksp-setup",
+            "--quiet",
+        ]
+    )
+
+    monkeypatch.setattr(cli_module, "load_parameter_search_space", lambda name, seed: "space")
+
+    def fake_run_tuning(**kwargs):
+        captured.update(kwargs)
+        return {"status": "completed"}
+
+    monkeypatch.setattr(cli_module, "run_tuning", fake_run_tuning)
+
+    assert cli_module.cmd_tune(args) == 0
+    assert captured["reuse_ksp_setup"] is False
+
+
+def test_tune_command_forwards_force_restart(monkeypatch) -> None:
+    captured = {}
+    args = build_parser().parse_args(
+        [
+            "tune",
+            "--snapshot-directory",
+            "snapshots.csv",
+            "--parameter-search-space",
+            "petsc.hypre-basic",
+            "--output-directory",
+            "run",
+            "--force-restart",
+            "--quiet",
+        ]
+    )
+
+    monkeypatch.setattr(cli_module, "load_parameter_search_space", lambda name, seed: "space")
+
+    def fake_run_tuning(**kwargs):
+        captured.update(kwargs)
+        return {"status": "completed"}
+
+    monkeypatch.setattr(cli_module, "run_tuning", fake_run_tuning)
+
+    assert cli_module.cmd_tune(args) == 0
+    assert captured["force_restart"] is True
+
+
+def test_tune_command_forwards_launcher_args_and_cache_budget(monkeypatch) -> None:
+    captured = {}
+    args = build_parser().parse_args(
+        [
+            "tune",
+            "--snapshot-directory",
+            "snapshots.csv",
+            "--parameter-search-space",
+            "petsc.hypre-basic",
+            "--output-directory",
+            "run",
+            "--mpiexec",
+            "srun",
+            "--mpiexec-arg=--exclusive",
+            "--replay-cache-memory-mb",
+            "1024",
+            "--quiet",
+        ]
+    )
+
+    monkeypatch.setattr(cli_module, "load_parameter_search_space", lambda name, seed: "space")
+
+    def fake_run_tuning(**kwargs):
+        captured.update(kwargs)
+        return {"status": "completed"}
+
+    monkeypatch.setattr(cli_module, "run_tuning", fake_run_tuning)
+
+    assert cli_module.cmd_tune(args) == 0
+    assert captured["mpiexec"] == "srun"
+    assert captured["mpiexec_args"] == ["--exclusive"]
+    assert captured["replay_cache_memory_mb"] == 1024
+
+
+def test_resume_command_forwards_runtime_overrides(monkeypatch) -> None:
+    captured = {}
+    args = build_parser().parse_args(
+        [
+            "resume",
+            "run",
+            "--trials",
+            "200",
+            "--run-until-stopped",
+            "--workers",
+            "3",
+            "--timeout-sec",
+            "120",
+            "--quiet",
+        ]
+    )
+
+    def fake_resume_tuning(*args, **kwargs):
+        captured["args"] = args
+        captured.update(kwargs)
+        return {"status": "completed"}
+
+    monkeypatch.setattr(cli_module, "resume_tuning", fake_resume_tuning)
+
+    assert cli_module.cmd_resume(args) == 0
+    assert captured["args"] == ("run",)
+    assert captured["trials"] == 200
+    assert captured["run_until_stopped"] is True
+    assert captured["workers"] == 3
+    assert captured["timeout_sec"] == 120
+    assert captured["progress_callback"] is None
 
 
 def test_tune_command_quiet_mode_does_not_emit_color(monkeypatch, capsys) -> None:
@@ -375,6 +596,7 @@ def test_tune_progress_prints_readable_trial_line(capsys) -> None:
             "peak_memory_mb_sum": 151.25,
             "peak_memory_mb_mean_per_rank": 151.25,
             "peak_memory_rank_count": 1,
+            "final_true_residual_norm_mean": 2.0e-8,
             "final_true_relative_residual_mean": 1.0e-9,
             "solver_configuration": {"ksp_type": "cg", "pc_type": "jacobi"},
             "smac_configuration_tag": "abc123",
@@ -389,7 +611,10 @@ def test_tune_progress_prints_readable_trial_line(capsys) -> None:
     assert "  solver: ksp=cg pc=jacobi" in output
     assert "  runtime: solve=0.100s  setup=0.030s  wall=0.150s" in output
     assert "  memory: total=151.2MB (ranks=1, avg/rank=151.2MB)" in output
-    assert "  diagnostics: iters=5 (samples=1, mean=5)  true_rel_res=1.000e-09" in output
+    assert (
+        "  diagnostics: iters=5 (samples=1, mean=5)  "
+        "true_res=2.000e-08  true_rel_res=1.000e-09"
+    ) in output
     assert output.endswith("\n")
     assert not output.endswith("\n\n")
 
@@ -430,6 +655,67 @@ def test_tune_progress_prints_total_and_average_solve_time(capsys) -> None:
         "min-max=3.250s-5.500s)  setup=0.030s  wall=250.000s"
     ) in output
     assert "  memory: total=1.2GB (ranks=8, avg/rank=151.2MB)" in output
+
+
+def test_tune_progress_prints_ksp_setup_cache_summary(capsys) -> None:
+    print_tune_progress(
+        {
+            "event": "trial_finished",
+            "trial_number": 3,
+            "trial_count": 20,
+            "objective_value": 4.12,
+            "total_wall_time_sec": 250.0,
+            "solver_setup_time_sec": 0.10,
+            "solver_setup_time_sec_actual": 0.02,
+            "ksp_setup_cache_hits": 4,
+            "ksp_setup_cache_misses": 1,
+            "solve_time_sec_total": 232.1,
+            "solve_time_sec_mean": 4.12,
+            "solve_count": 56,
+            "peak_memory_mb_sum": 1210.0,
+            "peak_memory_mb_mean_per_rank": 151.25,
+            "peak_memory_rank_count": 8,
+            "final_true_relative_residual_mean": 1.0e-9,
+            "solver_configuration": {"ksp_type": "cg", "pc_type": "jacobi"},
+            "smac_configuration_tag": "abc123",
+            "failure_reason": None,
+        }
+    )
+
+    output = capsys.readouterr().out
+    assert (
+        "setup=0.100s logical (actual=0.020s, ksp-cache=4/1)"
+    ) in output
+
+
+def test_tune_progress_prints_solve_mpi_summary(capsys) -> None:
+    print_tune_progress(
+        {
+            "event": "trial_finished",
+            "trial_number": 3,
+            "trial_count": 20,
+            "objective_value": 4.12,
+            "total_wall_time_sec": 250.0,
+            "solver_setup_time_sec": 0.03,
+            "solve_time_sec_total": 232.1,
+            "solve_time_sec_mean": 4.12,
+            "solve_count": 56,
+            "solve_mpi_message_count": 824.0,
+            "solve_mpi_message_bytes": 33.6 * 1024 * 1024,
+            "solve_mpi_message_bytes_mean": 42_767.28,
+            "solve_mpi_reduction_count": 216.0,
+            "peak_memory_mb_sum": 1210.0,
+            "peak_memory_mb_mean_per_rank": 151.25,
+            "peak_memory_rank_count": 8,
+            "final_true_relative_residual_mean": 1.0e-9,
+            "solver_configuration": {"ksp_type": "cg", "pc_type": "jacobi"},
+            "smac_configuration_tag": "abc123",
+            "failure_reason": None,
+        }
+    )
+
+    output = capsys.readouterr().out
+    assert "  mpi: solve msgs=824 bytes=33.6MB reductions=216 avg=41.8KB/msg" in output
 
 
 def test_tune_progress_colorizes_successful_trial_line(capsys) -> None:

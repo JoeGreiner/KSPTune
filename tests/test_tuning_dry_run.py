@@ -314,7 +314,7 @@ def test_run_until_stopped_writes_best_so_far_after_keyboard_interrupt(
         ),
     )
 
-    def fake_run_replay_for_solver_configuration(**kwargs):
+    def fake_run_replay_server_for_solver_configuration(**kwargs):
         return {
             "returncode": 0,
             "replay_result_path": str(kwargs["replay_result_path"]),
@@ -341,8 +341,8 @@ def test_run_until_stopped_writes_best_so_far_after_keyboard_interrupt(
         }
 
     monkeypatch.setattr(
-        "ksptune.tuning_runs.run_replay_for_solver_configuration",
-        fake_run_replay_for_solver_configuration,
+        "ksptune.tuning_runs.run_replay_server_for_solver_configuration",
+        fake_run_replay_server_for_solver_configuration,
     )
 
     events = []
@@ -450,7 +450,7 @@ def test_tuning_uses_auto_detected_replay_binary_when_not_provided(
     seen_replay_binaries = []
     seen_extra_replay_options = []
 
-    def fake_run_replay_for_solver_configuration(**kwargs):
+    def fake_run_replay_server_for_solver_configuration(**kwargs):
         seen_replay_binaries.append(kwargs["replay_binary"])
         seen_extra_replay_options.append(kwargs["extra_replay_options"])
         return {
@@ -487,8 +487,8 @@ def test_tuning_uses_auto_detected_replay_binary_when_not_provided(
         }
 
     monkeypatch.setattr(
-        "ksptune.tuning_runs.run_replay_for_solver_configuration",
-        fake_run_replay_for_solver_configuration,
+        "ksptune.tuning_runs.run_replay_server_for_solver_configuration",
+        fake_run_replay_server_for_solver_configuration,
     )
 
     events = []
@@ -500,6 +500,7 @@ def test_tuning_uses_auto_detected_replay_binary_when_not_provided(
         trials=1,
         workers=3,
         nullspace="field:1,block_size=2",
+        reuse_ksp_setup=False,
         progress_callback=events.append,
     )
 
@@ -513,17 +514,21 @@ def test_tuning_uses_auto_detected_replay_binary_when_not_provided(
             "1",
             "-replay_field_nullspace_block_size",
             "2",
+            "-replay_reuse_ksp_setup",
+            "false",
         ]
     ]
     tuning_run = yaml.safe_load((output_directory / "tuning_run.yaml").read_text(encoding="utf-8"))
     assert tuning_run["replay_binary"] == str(auto_replay_binary)
     assert tuning_run["replay_binary_auto_detected"] is True
     assert tuning_run["nullspace"]["label"] == "field:1"
+    assert tuning_run["reuse_ksp_setup"] is False
     assert tuning_run["workers"] == 3
     run_started = next(event for event in events if event["event"] == "run_started")
     assert run_started["replay_binary"] == str(auto_replay_binary)
     assert run_started["replay_binary_auto_detected"] is True
     assert run_started["nullspace_configuration"]["label"] == "field:1"
+    assert run_started["reuse_ksp_setup"] is False
     assert run_started["workers"] == 3
 
     trial_record = json.loads(
@@ -532,7 +537,171 @@ def test_tuning_uses_auto_detected_replay_binary_when_not_provided(
     assert trial_record["replay_command"][:2] == [str(auto_replay_binary), "-snapshot_collection"]
     assert "-replay_nullspace" in trial_record["replay_command"]
     assert "field" in trial_record["replay_command"]
+    assert "-replay_reuse_ksp_setup" in trial_record["replay_command"]
     assert trial_record["replay_command_text"].startswith(str(auto_replay_binary))
+
+
+def test_resume_tuning_appends_trials_and_reuses_smac_state(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    dump_directory = tmp_path / "dumps"
+    dump_directory.mkdir()
+    write_minimal_snapshot(dump_directory)
+    replay_binary = tmp_path / "ksptune-petsc-replay"
+    replay_binary.write_text("binary", encoding="utf-8")
+    output_directory = tmp_path / "run"
+    write_resume_run(output_directory, dump_directory, replay_binary=replay_binary, trials=3)
+
+    captured = {}
+
+    class DummyScenario:
+        def __init__(
+            self,
+            *,
+            configspace,
+            output_directory,
+            n_trials,
+            seed,
+            deterministic,
+            crash_cost,
+            n_workers,
+            use_default_config,
+            name=None,
+        ):
+            self.configspace = configspace
+            self.output_directory = output_directory
+            self.n_trials = n_trials
+            self.seed = seed
+            self.deterministic = deterministic
+            self.crash_cost = crash_cost
+            self.n_workers = n_workers
+            self.use_default_config = use_default_config
+            self.name = name
+            captured["scenario"] = self
+
+    class DummyFacade:
+        @staticmethod
+        def get_initial_design(scenario, **kwargs):
+            return SimpleNamespace(scenario=scenario, **kwargs)
+
+        def __init__(self, *, scenario, target_function, callbacks, initial_design, overwrite):
+            self.scenario = scenario
+            self.target_function = target_function
+            self.callbacks = callbacks
+            self.initial_design = initial_design
+            self.overwrite = overwrite
+            captured["overwrite"] = overwrite
+
+        def optimize(self):
+            cost, additional_info = self.target_function(
+                self.scenario.configspace.get_default_configuration()
+            )
+            trial_info = SimpleNamespace(config=self.scenario.configspace.get_default_configuration())
+            trial_value = SimpleNamespace(cost=cost, additional_info=additional_info)
+            for callback in self.callbacks:
+                callback.on_tell_end(None, trial_info, trial_value)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "smac",
+        SimpleNamespace(
+            HyperparameterOptimizationFacade=DummyFacade,
+            Scenario=DummyScenario,
+        ),
+    )
+
+    def fake_run_replay_server_for_solver_configuration(**kwargs):
+        return {
+            "command": [
+                str(kwargs["replay_binary"]),
+                "-snapshot_collection",
+                str(kwargs["snapshot_collection_path"]),
+            ],
+            "returncode": 0,
+            "replay_result_path": str(kwargs["replay_result_path"]),
+            "schema_errors": [],
+            "subprocess_wall_time_sec": 0.2,
+            "failure_reason": None,
+            "replay_result": {
+                "objective_time_sec_median": 0.6,
+                "total_wall_time_sec": 0.7,
+                "matrix_load_time_sec": 0.01,
+                "solver_setup_time_sec": 0.02,
+                "solve_time_sec_mean": 0.6,
+                "solve_time_sec_median": 0.6,
+                "iterations_total": 5,
+                "snapshots": 1,
+                "steps": [],
+                "converged": True,
+                "reason": "KSP_CONVERGED_RTOL",
+                "reason_code": 2,
+                "peak_memory_mb_max_per_rank": 64.0,
+                "final_true_relative_residual_mean": 1.0e-9,
+                "final_true_residual_norm_mean": 1.0e-10,
+            },
+        }
+
+    monkeypatch.setattr(
+        "ksptune.tuning_runs.run_replay_server_for_solver_configuration",
+        fake_run_replay_server_for_solver_configuration,
+    )
+
+    events = []
+    result = resume_tuning(
+        output_directory,
+        trials=3,
+        workers=2,
+        progress_callback=events.append,
+    )
+
+    assert result["status"] == "completed"
+    assert captured["overwrite"] is False
+    assert captured["scenario"].name == "oldsmac"
+    assert captured["scenario"].n_trials == 3
+    assert captured["scenario"].n_workers == 2
+    records = [
+        json.loads(line)
+        for line in (output_directory / "solver_configuration_trials.jsonl")
+        .read_text(encoding="utf-8")
+        .splitlines()
+    ]
+    assert [record["trial_number"] for record in records] == [1, 2]
+    assert records[0]["smac_configuration_tag"] == "old001"
+    assert records[1]["objective_value"] == 0.6
+    assert result["best_cost"] == 0.5
+    run_started = next(event for event in events if event["event"] == "run_started")
+    assert run_started["resume"] is True
+    assert run_started["completed_trials"] == 1
+    assert run_started["remaining_trials"] == 2
+    scenario_json = json.loads(
+        (output_directory / "smac" / "oldsmac" / "1" / "scenario.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert scenario_json["n_trials"] == 3
+    assert scenario_json["n_workers"] == 2
+
+
+def test_resume_tuning_refreshes_outputs_when_target_is_already_reached(
+    tmp_path: Path,
+) -> None:
+    dump_directory = tmp_path / "dumps"
+    dump_directory.mkdir()
+    write_minimal_snapshot(dump_directory)
+    replay_binary = tmp_path / "ksptune-petsc-replay"
+    replay_binary.write_text("binary", encoding="utf-8")
+    output_directory = tmp_path / "run"
+    write_resume_run(output_directory, dump_directory, replay_binary=replay_binary, trials=1)
+
+    result = resume_tuning(output_directory, trials=1)
+
+    assert result["status"] == "completed"
+    assert result["best_cost"] == 0.5
+    records = load_trial_records(output_directory / "solver_configuration_trials.jsonl")
+    assert len(records) == 1
+    summary = yaml.safe_load((output_directory / "tuning_summary.yaml").read_text(encoding="utf-8"))
+    assert summary["trial_count"] == 1
 
 
 def test_tuning_configures_default_and_seeded_initial_design(

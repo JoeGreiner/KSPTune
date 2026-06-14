@@ -30,6 +30,7 @@ from .replay import (
     replay_failure_reason,
     replay_metric_summary,
     replay_objective_value,
+    run_replay_server_for_solver_configuration,
     run_replay_for_solver_configuration,
 )
 from .snapshot_collections import (
@@ -60,6 +61,10 @@ TRIAL_CSV_COLUMNS = [
     "subprocess_wall_time_sec",
     "matrix_load_time_sec",
     "solver_setup_time_sec",
+    "solver_setup_time_sec_actual",
+    "solver_setup_time_sec_logical",
+    "ksp_setup_cache_hits",
+    "ksp_setup_cache_misses",
     "solve_time_sec_total",
     "solve_time_sec_mean",
     "solve_time_sec_median",
@@ -67,6 +72,10 @@ TRIAL_CSV_COLUMNS = [
     "solve_time_sec_max",
     "solve_time_sec_stddev",
     "solve_time_sec_range",
+    "solve_mpi_message_count",
+    "solve_mpi_message_bytes",
+    "solve_mpi_message_bytes_mean",
+    "solve_mpi_reduction_count",
     "solve_count",
     "iterations_total",
     "iterations_median",
@@ -92,9 +101,11 @@ TRIAL_CSV_COLUMNS = [
     "pc_type",
     "petsc_options_text",
     "solver_configuration_json",
+    "replay_mode",
     "replay_result_path",
     "returncode",
     "replay_command_text",
+    "replay_server_command_text",
 ]
 
 
@@ -316,6 +327,11 @@ def compact_trial_summary(record: dict[str, Any] | None) -> dict[str, Any] | Non
         "smac_configuration_tag": record.get("smac_configuration_tag"),
         "objective_value": record.get("objective_value"),
         "total_wall_time_sec": record.get("total_wall_time_sec"),
+        "solver_setup_time_sec": record.get("solver_setup_time_sec"),
+        "solver_setup_time_sec_actual": record.get("solver_setup_time_sec_actual"),
+        "solver_setup_time_sec_logical": record.get("solver_setup_time_sec_logical"),
+        "ksp_setup_cache_hits": record.get("ksp_setup_cache_hits"),
+        "ksp_setup_cache_misses": record.get("ksp_setup_cache_misses"),
         "solve_time_sec_total": record.get("solve_time_sec_total"),
         "solve_time_sec_mean": record.get("solve_time_sec_mean"),
         "solve_time_sec_median": record.get("solve_time_sec_median"),
@@ -323,6 +339,10 @@ def compact_trial_summary(record: dict[str, Any] | None) -> dict[str, Any] | Non
         "solve_time_sec_max": record.get("solve_time_sec_max"),
         "solve_time_sec_stddev": record.get("solve_time_sec_stddev"),
         "solve_time_sec_range": record.get("solve_time_sec_range"),
+        "solve_mpi_message_count": record.get("solve_mpi_message_count"),
+        "solve_mpi_message_bytes": record.get("solve_mpi_message_bytes"),
+        "solve_mpi_message_bytes_mean": record.get("solve_mpi_message_bytes_mean"),
+        "solve_mpi_reduction_count": record.get("solve_mpi_reduction_count"),
         "solve_count": record.get("solve_count"),
         "peak_memory_mb_sum": record.get("peak_memory_mb_sum"),
         "peak_memory_mb_max_per_rank": record.get("peak_memory_mb_max_per_rank"),
@@ -655,6 +675,8 @@ def run_tuning(
         *list(nullspace_configuration["replay_options"]),
         *list(nullspace_action_configuration["replay_options"]),
     ]
+    if not reuse_ksp_setup:
+        nullspace_replay_options.extend(["-replay_reuse_ksp_setup", "false"])
 
     snapshot_directory_path = Path(snapshot_directory).resolve()
     snapshot_summary = summarize_snapshot_directory(snapshot_directory_path)
@@ -1004,7 +1026,8 @@ def run_tuning(
             parameter_search_space,
             solver_configuration,
         )
-        replay_record = run_replay_for_solver_configuration(
+        replay_record = run_replay_server_for_solver_configuration(
+            replay_worker_pool=replay_worker_pool,
             replay_binary=replay_binary_path,
             snapshot_collection_path=replay_snapshot_collection_path,
             replay_result_path=(
@@ -1014,6 +1037,7 @@ def run_tuning(
             ),
             petsc_options=petsc_options,
             mpiexec=mpiexec,
+            mpiexec_args=resolved_mpiexec_args,
             mpi_processes=mpi_processes,
             repeat=repeat,
             warmup=warmup,
@@ -1036,6 +1060,11 @@ def run_tuning(
             "petsc_options_text": petsc_options_to_text(petsc_options),
             "replay_command": replay_command,
             "replay_command_text": shlex.join(str(part) for part in replay_command),
+            "replay_server_command": replay_record.get("replay_server_command"),
+            "replay_server_command_text": shlex.join(
+                str(part) for part in replay_record.get("replay_server_command", [])
+            ),
+            "replay_mode": replay_record.get("replay_mode", "server"),
             "objective_name": objective_name,
             "objective_value": cost,
             "replay_result_path": replay_record["replay_result_path"],

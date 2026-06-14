@@ -69,6 +69,20 @@ def format_mb(value: Any) -> str:
     return f"{numeric_value:.1f}MB"
 
 
+def format_bytes(value: Any) -> str:
+    if value is None:
+        return "n/a"
+    numeric_value = float(value)
+    units = ["B", "KB", "MB", "GB", "TB"]
+    unit_index = 0
+    while abs(numeric_value) >= 1024.0 and unit_index + 1 < len(units):
+        numeric_value /= 1024.0
+        unit_index += 1
+    if unit_index == 0:
+        return f"{numeric_value:.0f}{units[unit_index]}"
+    return f"{numeric_value:.1f}{units[unit_index]}"
+
+
 def format_float(value: Any) -> str:
     if value is None:
         return "n/a"
@@ -307,6 +321,40 @@ def format_solve_runtime(event: dict[str, Any]) -> str:
     return format_sec(solve_median)
 
 
+def format_setup_runtime(event: dict[str, Any]) -> str:
+    setup_time = event.get("solver_setup_time_sec")
+    actual_setup_time = event.get("solver_setup_time_sec_actual")
+    cache_hits = event.get("ksp_setup_cache_hits")
+    cache_misses = event.get("ksp_setup_cache_misses")
+    try:
+        cache_hits_int = int(cache_hits) if cache_hits is not None else 0
+        cache_misses_int = int(cache_misses) if cache_misses is not None else 0
+    except (TypeError, ValueError):
+        cache_hits_int = 0
+        cache_misses_int = 0
+
+    try:
+        setup_time_differs = (
+            setup_time is not None
+            and actual_setup_time is not None
+            and float(setup_time) != float(actual_setup_time)
+        )
+    except (TypeError, ValueError):
+        setup_time_differs = False
+
+    if (
+        setup_time is not None
+        and actual_setup_time is not None
+        and (cache_hits_int > 0 or setup_time_differs)
+    ):
+        return (
+            f"{format_sec(setup_time)} logical "
+            f"(actual={format_sec(actual_setup_time)}, "
+            f"ksp-cache={cache_hits_int}/{cache_misses_int})"
+        )
+    return format_sec(setup_time)
+
+
 def format_iterations(event: dict[str, Any]) -> str:
     iterations_total = event.get("iterations_total")
     if iterations_total is None:
@@ -350,6 +398,26 @@ def format_memory_summary(event: dict[str, Any]) -> str:
     if memory_mean_per_rank is not None:
         return f"avg/rank={format_mb(memory_mean_per_rank)}"
     return "n/a"
+
+
+def format_mpi_summary(event: dict[str, Any]) -> str | None:
+    message_count = event.get("solve_mpi_message_count")
+    message_bytes = event.get("solve_mpi_message_bytes")
+    reduction_count = event.get("solve_mpi_reduction_count")
+    if message_count is None and message_bytes is None and reduction_count is None:
+        return None
+
+    parts = ["solve"]
+    if message_count is not None:
+        parts.append(f"msgs={format_float(message_count)}")
+    if message_bytes is not None:
+        parts.append(f"bytes={format_bytes(message_bytes)}")
+    if reduction_count is not None:
+        parts.append(f"reductions={format_float(reduction_count)}")
+    mean_message_bytes = event.get("solve_mpi_message_bytes_mean")
+    if mean_message_bytes is not None and float(message_count or 0) > 0.0:
+        parts.append(f"avg={format_bytes(mean_message_bytes)}/msg")
+    return " ".join(parts)
 
 
 def format_nullspace_configuration(configuration: dict[str, Any] | None) -> str:
@@ -547,7 +615,8 @@ def print_tune_progress(event: dict[str, Any], *, color_enabled: bool = False) -
 
     if event_name == "trial_finished":
         wall_time = format_sec(event.get("total_wall_time_sec"))
-        residual = format_float(event.get("final_true_relative_residual_mean"))
+        true_residual = format_float(event.get("final_true_residual_norm_mean"))
+        true_relative_residual = format_float(event.get("final_true_relative_residual_mean"))
         solver_configuration = format_solver_configuration(event)
         failure_reason = event.get("failure_reason")
         lines = [
@@ -579,11 +648,17 @@ def print_tune_progress(event: dict[str, Any], *, color_enabled: bool = False) -
                     )
                 )
         else:
-            setup_time = format_sec(event.get("solver_setup_time_sec"))
+            setup_time = format_setup_runtime(event)
             solve_time = format_solve_runtime(event)
             lines.append(f"  runtime: solve={solve_time}  setup={setup_time}  wall={wall_time}")
             lines.append(f"  memory: {format_memory_summary(event)}")
-            lines.append(f"  diagnostics: iters={format_iterations(event)}  true_rel_res={residual}")
+            mpi_summary = format_mpi_summary(event)
+            if mpi_summary is not None:
+                lines.append(f"  mpi: {mpi_summary}")
+            lines.append(
+                f"  diagnostics: iters={format_iterations(event)}  "
+                f"true_res={true_residual}  true_rel_res={true_relative_residual}"
+            )
         print_block(lines)
         return
 
@@ -636,6 +711,7 @@ def cmd_tune(args: argparse.Namespace) -> int:
         output_directory=args.output_directory,
         replay_binary=args.replay_binary,
         mpiexec=args.mpiexec,
+        mpiexec_args=args.mpiexec_arg,
         mpi_processes=args.np,
         threads_per_rank=args.threads_per_rank,
         workers=args.workers,
@@ -762,6 +838,15 @@ def build_parser() -> argparse.ArgumentParser:
     tune.add_argument("--output-directory", required=True)
     tune.add_argument("--replay-binary")
     tune.add_argument("--mpiexec", default="mpiexec")
+    tune.add_argument(
+        "--mpiexec-arg",
+        action="append",
+        default=[],
+        help=(
+            "Additional argument passed to the MPI launcher. Repeat for multiple arguments. "
+            "Use --mpiexec-arg=--flag when the launcher argument starts with '-'."
+        ),
+    )
     tune.add_argument("--np", type=int, default=1)
     tune.add_argument("--threads-per-rank", type=int, default=1)
     tune.add_argument(
