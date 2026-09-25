@@ -22,6 +22,7 @@ from ksptune.tuning_runs import (
     TuningSettings,
     settings_to_dict,
     HYPRE_HIERARCHY_REPLAY_OPTION,
+    KSPTuneOrderedInitialDesign,
     REPLAY_BINARY_ENV_VAR,
     count_tunable_hyperparameters,
     find_default_replay_binary,
@@ -229,7 +230,7 @@ def write_resume_run(
     snapshots = load_snapshots_from_directory(snapshot_directory)
     write_snapshot_collection(snapshots, snapshot_collection_path, relative_paths=True)
     write_snapshot_collection(snapshots, replay_snapshot_collection_path)
-    write_configspace_json(load_parameter_search_space("petsc.hypre-basic"),
+    write_configspace_json(load_parameter_search_space("petsc.boomeramg_basic"),
                            output_directory / "configspace.json")
     yaml.safe_dump(
         {
@@ -245,8 +246,8 @@ def write_resume_run(
             "metadata": {
                 "snapshot_collection_path": str(snapshot_collection_path),
                 "replay_snapshot_collection_path": str(replay_snapshot_collection_path),
-                "parameter_search_space": "petsc.hypre-basic",
-                "parameter_search_space_source": "builtin:petsc.hypre-basic",
+                "parameter_search_space": "petsc.boomeramg_basic",
+                "parameter_search_space_source": "builtin:petsc.boomeramg_basic",
                 "use_default_solver_configuration": True,
                 "sobol_initial_design_configurations": 1,
                 "initial_solver_configurations": [],
@@ -292,9 +293,9 @@ def write_resume_run(
 
 
 def test_initial_design_helpers_count_only_tunable_hyperparameters() -> None:
-    parameter_search_space = load_parameter_search_space("petsc.hypre-basic")
+    parameter_search_space = load_parameter_search_space("petsc.boomeramg_basic")
 
-    assert len(parameter_search_space) == 12
+    assert len(parameter_search_space) == 15
     assert count_tunable_hyperparameters(parameter_search_space) == 8
     assert resolve_sobol_initial_design_configuration_count(
         tunable_parameter_count=8,
@@ -319,10 +320,45 @@ def test_initial_design_helpers_count_only_tunable_hyperparameters() -> None:
     ) == 7
 
 
+def test_ordered_initial_design_puts_seeded_configurations_before_default_and_sobol() -> None:
+    parameter_search_space = load_parameter_search_space("petsc.boomeramg_basic")
+    records = initial_solver_configuration_records_from_parameter_search_space(
+        parameter_search_space
+    )
+    default_configuration = parameter_search_space.get_default_configuration()
+    default_configuration.origin = "Initial Design: Default configuration"
+    sobol_like_configuration = records[4]["configuration"]
+
+    base_initial_design = SimpleNamespace(
+        meta={"name": "DummySobol"},
+        select_configurations=lambda: [
+            sobol_like_configuration,
+            default_configuration,
+            records[0]["configuration"],
+        ],
+    )
+    initial_design = KSPTuneOrderedInitialDesign(
+        base_initial_design=base_initial_design,
+        leading_configurations=[
+            records[0]["configuration"],
+            records[1]["configuration"],
+        ],
+        include_default_configuration=True,
+        configuration_space=parameter_search_space,
+    )
+
+    configurations = initial_design.select_configurations()
+
+    assert configurations == [
+        records[0]["configuration"],
+        records[1]["configuration"],
+        default_configuration,
+        sobol_like_configuration,
+    ]
 
 
-def test_hypre_basicinitial_solver_configurations_are_legal() -> None:
-    parameter_search_space = load_parameter_search_space("petsc.hypre-basic")
+def test_boomeramg_basic_initial_solver_configurations_are_legal() -> None:
+    parameter_search_space = load_parameter_search_space("petsc.boomeramg_basic")
 
     records = initial_solver_configuration_records_from_parameter_search_space(
         parameter_search_space
@@ -330,24 +366,158 @@ def test_hypre_basicinitial_solver_configurations_are_legal() -> None:
     labels = [record["label"] for record in records]
 
     assert labels == [
-        "joe_hypre_opts8",
-        "joe_hypre_opts9_projected",
-        "joe_hypre_opts4_projected",
-        "joe_hypre_opts3_projected",
+        "boomeramg_exti_threshold_0p05",
+        "boomeramg_ff_agg_1_paths_2",
+        "boomeramg_hmis_exti_pmax_3",
+        "boomeramg_exti_pmax_8",
+        "boomeramg_pmis_exticc_agg_0",
+        "boomeramg_pmis_ff_pmax_3_paths_1",
+        "boomeramg_pmis_extimm_pmax_3_paths_1",
+        "boomeramg_sor_pmis_extemm_pmax_15_paths_3",
+        "boomeramg_hmis_exti_paths_2",
+        "boomeramg_pmis_exti_paths_2",
+        "boomeramg_hmis_extimm_paths_2",
+        "boomeramg_pmis_exti_paths_3",
+        "boomeramg_hmis_ff_paths_1",
+        "boomeramg_pmis_extimm_agg_0",
+        "boomeramg_pmis_ff_agg_0",
+        "boomeramg_sor_pmis_exti_pmax_0_paths_3",
+        "boomeramg_sor_pmis_ext_pmax_12_paths_3",
+        "boomeramg_sor_hmis_extemm_pmax_10_paths_3",
     ]
-    assert "joe_hypre_opts11" not in labels
     for record in records:
-        assert record["solver_configuration"]["ksp_type"] == "fgmres"
+        assert record["solver_configuration"]["ksp_type"] == "gmres"
+        assert record["solver_configuration"]["ksp_pc_side"] == "left"
         assert record["solver_configuration"]["pc_type"] == "hypre"
         assert record["configuration"].origin.startswith(
             "KSPTune initial solver configuration:"
         )
 
 
+def test_boomeramg_extended_initial_solver_configurations_are_legal() -> None:
+    parameter_search_space = load_parameter_search_space("petsc.boomeramg_extended")
+
+    records = initial_solver_configuration_records_from_parameter_search_space(
+        parameter_search_space
+    )
+    labels = [record["label"] for record in records]
+
+    assert "boomeramg_pmis_exticc_agg_0" in labels
+    assert labels[-7:] == [
+        "boomeramg_hmis_exti_paths_2",
+        "boomeramg_pmis_exti_paths_2",
+        "boomeramg_hmis_extimm_paths_2",
+        "boomeramg_pmis_exti_paths_3",
+        "boomeramg_hmis_ff_paths_1",
+        "boomeramg_pmis_extimm_agg_0",
+        "boomeramg_pmis_ff_agg_0",
+    ]
+    for record in records:
+        assert record["solver_configuration"]["ksp_type"] == "gmres"
+        assert record["solver_configuration"]["ksp_pc_side"] == "left"
+        assert record["solver_configuration"]["pc_type"] == "hypre"
+        assert record["configuration"].origin.startswith(
+            "KSPTune initial solver configuration:"
+        )
 
 
+def test_gamg_initial_solver_configurations_are_legal() -> None:
+    parameter_search_space = load_parameter_search_space("petsc.gamg_basic")
+
+    records = initial_solver_configuration_records_from_parameter_search_space(
+        parameter_search_space
+    )
+    labels = [record["label"] for record in records]
+
+    assert labels == [
+        "gamg_mis_chebyshev_jacobi_compact",
+        "gamg_mis_parallel_coarse_compact",
+        "gamg_mis_low_peak_compact",
+        "gamg_mis_repartition_spread",
+        "gamg_mis_sor_low_mpi",
+        "gamg_misk_startup_seed",
+        "gamg_mis_threshold_0_baseline",
+    ]
+    for record in records:
+        solver_configuration = record["solver_configuration"]
+        assert solver_configuration["ksp_type"] == "gmres"
+        assert solver_configuration["ksp_pc_side"] == "left"
+        assert solver_configuration["pc_type"] == "gamg"
+        assert record["configuration"].origin.startswith(
+            "KSPTune initial solver configuration:"
+        )
+
+    ok_mis = next(
+        record
+        for record in records
+        if record["label"] == "gamg_mis_threshold_0_baseline"
+    )
+    assert ok_mis["solver_configuration"]["pc_gamg_mat_coarsen_type"] == "mis"
+    assert ok_mis["solver_configuration"]["pc_gamg_aggressive_square_graph"] is False
+    assert ok_mis["solver_configuration"]["pc_gamg_aggressive_mis_k"] == 2
+    assert "pc_gamg_mat_coarsen_misk_distance" not in ok_mis["solver_configuration"]
+    ok_misk = next(
+        record
+        for record in records
+        if record["label"]
+        == "gamg_misk_startup_seed"
+    )
+    assert ok_misk["solver_configuration"]["mg_levels_ksp_type"] == "chebyshev"
+    assert ok_misk["solver_configuration"]["mg_levels_pc_type"] == "jacobi"
+    assert ok_misk["solver_configuration"]["pc_gamg_mat_coarsen_type"] == "misk"
+    assert ok_misk["solver_configuration"]["pc_gamg_mat_coarsen_misk_distance"] == 1
+    best_mis = next(
+        record
+        for record in records
+        if record["label"] == "gamg_mis_chebyshev_jacobi_compact"
+    )
+    assert best_mis["solver_configuration"]["pc_gamg_mat_coarsen_type"] == "mis"
+    assert best_mis["solver_configuration"]["pc_gamg_aggressive_square_graph"] is False
+    assert best_mis["solver_configuration"]["pc_gamg_threshold_scale"] == 1.0
+    assert best_mis["solver_configuration"]["pc_gamg_parallel_coarse_grid_solver"] is False
+    low_mpi = next(
+        record
+        for record in records
+        if record["label"] == "gamg_mis_sor_low_mpi"
+    )
+    assert low_mpi["solver_configuration"]["mg_levels_pc_type"] == "sor"
+    assert low_mpi["solver_configuration"]["pc_gamg_agg_nsmooths"] == 2
+    repartition = next(
+        record
+        for record in records
+        if record["label"] == "gamg_mis_repartition_spread"
+    )
+    assert repartition["solver_configuration"]["pc_gamg_repartition"] is True
+    assert repartition["solver_configuration"]["pc_gamg_parallel_coarse_grid_solver"] is True
 
 
+def test_gamg_mono_initial_solver_configurations_are_legal() -> None:
+    parameter_search_space = load_parameter_search_space("petsc.gamg_extended_mono")
+
+    records = initial_solver_configuration_records_from_parameter_search_space(
+        parameter_search_space
+    )
+    labels = [record["label"] for record in records]
+
+    assert labels[-1] == "gamg_chebyshev_rowl1"
+    assert "gamg_mis_low_memory_filter_probe" not in labels
+    for record in records:
+        solver_configuration = record["solver_configuration"]
+        assert solver_configuration["ksp_type"] == "gmres"
+        assert solver_configuration["ksp_pc_side"] == "left"
+        assert solver_configuration["pc_type"] == "gamg"
+        assert solver_configuration["ksp_rtol"] == 1.0e-8
+        assert solver_configuration["mg_coarse_pc_type"] != "ilu"
+        assert solver_configuration["pc_gamg_low_memory_threshold_filter"] is False
+        if solver_configuration["mg_levels_ksp_type"] == "chebyshev":
+            assert solver_configuration["mg_levels_ksp_chebyshev_esteig_noisy"] is True
+        assert not any(
+            "nullspace" in parameter_name or "block_size" in parameter_name
+            for parameter_name in solver_configuration
+        )
+        assert record["configuration"].origin.startswith(
+            "KSPTune initial solver configuration:"
+        )
 
 def test_tuning_dry_run_writes_reproducible_files(tmp_path: Path) -> None:
     dump_directory = tmp_path / "dumps"
@@ -364,7 +534,7 @@ def test_tuning_dry_run_writes_reproducible_files(tmp_path: Path) -> None:
             replay_startup_timeout_sec=123.0,
             dry_run=True,
         ),
-        parameter_search_space=load_parameter_search_space("petsc.hypre-basic"),
+        parameter_search_space=load_parameter_search_space("petsc.boomeramg_basic"),
     )
 
     assert result["status"] == "dry-run"
@@ -415,7 +585,7 @@ def test_tuning_dry_run_records_fast_fail_mode(tmp_path: Path) -> None:
             dry_run=True,
             fast_fail=True,
         ),
-        parameter_search_space=load_parameter_search_space("petsc.hypre-basic"),
+        parameter_search_space=load_parameter_search_space("petsc.boomeramg_basic"),
     )
 
     tuning_run = yaml.safe_load((output_directory / "tuning_run.yaml").read_text(encoding="utf-8"))
@@ -438,7 +608,7 @@ def test_tuning_refuses_existing_run_directory_without_force_restart(tmp_path: P
                 output_directory=output_directory,
                 dry_run=True,
             ),
-            parameter_search_space=load_parameter_search_space("petsc.hypre-basic"),
+            parameter_search_space=load_parameter_search_space("petsc.boomeramg_basic"),
         )
 
 
@@ -461,7 +631,7 @@ def test_tuning_force_restart_allows_existing_run_directory(tmp_path: Path) -> N
             dry_run=True,
             force_restart=True,
         ),
-        parameter_search_space=load_parameter_search_space("petsc.hypre-basic"),
+        parameter_search_space=load_parameter_search_space("petsc.boomeramg_basic"),
     )
 
     assert result["status"] == "dry-run"
@@ -581,7 +751,7 @@ def test_run_until_stopped_writes_best_so_far_after_keyboard_interrupt(
             replay_binary=replay_binary,
             run_until_stopped=True,
         ),
-        parameter_search_space=load_parameter_search_space("petsc.hypre-basic"),
+        parameter_search_space=load_parameter_search_space("petsc.boomeramg_basic"),
         progress_callback=events.append,
     )
 
@@ -752,7 +922,7 @@ def test_tuning_uses_auto_detected_replay_binary_when_not_provided(
             use_initial_guess=False,
             fast_fail=True,
         ),
-        parameter_search_space=load_parameter_search_space("petsc.hypre-basic"),
+        parameter_search_space=load_parameter_search_space("petsc.boomeramg_basic"),
         progress_callback=events.append,
     )
 
@@ -1009,6 +1179,108 @@ def test_resume_tuning_refreshes_outputs_when_target_is_already_reached(
     assert tuning_run["settings"]["max_true_residual_norm"] == 2.0e-3
 
 
+def test_tuning_configures_seeded_first_initial_design(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    dump_directory = tmp_path / "dumps"
+    dump_directory.mkdir()
+    write_minimal_snapshot(dump_directory)
+    snapshot_directory = dump_directory
+
+    captured = {}
+
+    class DummyScenario:
+        def __init__(
+            self,
+            *,
+            configspace,
+            output_directory,
+            n_trials,
+            seed,
+            deterministic,
+            crash_cost,
+            n_workers,
+            use_default_config,
+        ):
+            self.configspace = configspace
+            self.output_directory = output_directory
+            self.n_trials = n_trials
+            self.seed = seed
+            self.deterministic = deterministic
+            self.crash_cost = crash_cost
+            self.n_workers = n_workers
+            self.use_default_config = use_default_config
+            captured["scenario"] = self
+
+    class DummyFacade:
+        @staticmethod
+        def get_initial_design(scenario, **kwargs):
+            captured["initial_design_kwargs"] = kwargs
+            return SimpleNamespace(scenario=scenario, **kwargs)
+
+        def __init__(self, *, scenario, target_function, callbacks, initial_design, overwrite):
+            self.scenario = scenario
+            self.target_function = target_function
+            self.callbacks = callbacks
+            self.initial_design = initial_design
+            self.overwrite = overwrite
+            captured["initial_design"] = initial_design
+
+        def optimize(self):
+            return None
+
+    monkeypatch.setitem(
+        sys.modules,
+        "smac",
+        SimpleNamespace(
+            HyperparameterOptimizationFacade=DummyFacade,
+            Scenario=DummyScenario,
+        ),
+    )
+
+    events = []
+    output_directory = tmp_path / "run"
+    replay_binary = write_executable_file(tmp_path / "dummy-replay")
+    run_tuning(
+        TuningSettings(
+            snapshot_directory=snapshot_directory,
+            output_directory=output_directory,
+            replay_binary=replay_binary,
+            trials=12,
+            workers=4,
+        ),
+        parameter_search_space=load_parameter_search_space("petsc.boomeramg_basic"),
+        progress_callback=events.append,
+    )
+
+    assert captured["scenario"].use_default_config is False
+    assert isinstance(captured["initial_design"], KSPTuneOrderedInitialDesign)
+    assert captured["initial_design_kwargs"]["n_configs"] == 0
+    assert captured["initial_design_kwargs"]["max_ratio"] == 1.0
+    assert captured["initial_design_kwargs"]["additional_configs"] == []
+    assert len(captured["initial_design"].leading_configurations) == 12
+
+    tuning_run = yaml.safe_load((output_directory / "tuning_run.yaml").read_text(encoding="utf-8"))
+    assert tuning_run["metadata"]["initial_design_order"] == "seeded-first"
+    assert tuning_run["metadata"]["use_default_solver_configuration"] is False
+    assert tuning_run["metadata"]["tunable_parameter_count"] == 8
+    assert tuning_run["metadata"]["sobol_initial_design_configurations"] == 0
+    assert tuning_run["metadata"]["startup_initial_solver_configuration_count"] == 4
+    assert tuning_run["metadata"]["startup_initial_solver_configurations"] == [
+        "boomeramg_exti_threshold_0p05",
+        "boomeramg_ff_agg_1_paths_2",
+        "boomeramg_hmis_exti_pmax_3",
+        "boomeramg_exti_pmax_8",
+    ]
+    assert tuning_run["metadata"]["additionalinitial_solver_configuration_count"] == 12
+    assert tuning_run["metadata"]["additionalinitial_solver_configurations"][0] == "boomeramg_exti_threshold_0p05"
+    assert "boomeramg_pmis_exticc_agg_0" in tuning_run["metadata"]["additionalinitial_solver_configurations"]
+
+    run_started = next(event for event in events if event["event"] == "run_started")
+    assert run_started["sobol_initial_design_configurations"] == 0
+    assert run_started["startup_initial_solver_configuration_count"] == 4
+    assert run_started["additionalinitial_solver_configuration_count"] == 12
 
 
 def test_known_smac_empty_neighbor_runtime_warning_is_filtered() -> None:

@@ -101,13 +101,13 @@ Generated filenames distinguish runs and KSPs. Repeated solve indices are allowe
 ## 5. Tune snapshots
 
 Important: Use the same number of processes as in the openCARP run.
-The parameter space petsc.hypre-basic is already supplied by the package, but you can also [add your own](parameter-files.md#custom-file).
+The parameter space petsc.boomeramg_basic is already supplied by the package, but you can also [add your own](parameter-files.md#custom-file).
 
 ```bash
 cd "$ksptune_dir"
 ksptune tune \
   --snapshot-directory "$simulation_dir/snapshots" \
-  --parameter-search-space petsc.hypre-basic \
+  --parameter-search-space petsc.boomeramg_basic \
   --output-directory "$simulation_dir/ksptune" \
   --np 10 --workers 1 --trials 50 --warmup 0 --repeat 1
 ```

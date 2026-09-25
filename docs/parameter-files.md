@@ -2,6 +2,7 @@
 
 Built-in files are located in `src/ksptune/builtin_parameter_search_spaces/`.
 Please refer to them as examples.
+Names use underscores, with optional `basic`/`extended` and a trailing `mono` for monodomain spaces.
 
 Example exercept:
 ```python
@@ -41,9 +42,10 @@ parameter_search_space.add(
 
 ## Types
 
-The quoted parameter name must match a PETSc option. For example,
+By default, the quoted parameter name must match a PETSc option. For example,
 `"pc_hypre_boomeramg_coarsen_type"` becomes `-pc_hypre_boomeramg_coarsen_type`.
 The Python variable name can be chosen freely.
+Internal controls use `meta={"emit": False}` and names ending in `_mode` or `_enabled`.
 
 
 Available Types (see the [ConfigSpace documentation](https://automl.github.io/ConfigSpace/latest/reference/hyperparameters/)
@@ -121,7 +123,7 @@ Import these classes from `ConfigSpace.conditions`. For more conditions, see
 ## Validation
 
 ```bash
-ksptune parameter-search-spaces validate petsc.hypre-basic
+ksptune parameter-search-spaces validate petsc.boomeramg_basic
 ```
 
 It checks syntax, but not the options against the replay tool's PETSc build.

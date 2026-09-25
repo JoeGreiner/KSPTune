@@ -385,7 +385,7 @@ def initial_solver_configuration_records_from_parameter_search_space(
 ) -> list[dict[str, Any]]:
     from ConfigSpace import Configuration
 
-    raw_records = list(getattr(parameter_search_space, "_ksptuneinitial_solver_configurations", []))
+    raw_records = list(getattr(parameter_search_space, "_ksptune_initial_solver_configurations", []))
     records: list[dict[str, Any]] = []
     default_solver_configuration = default_solver_configuration_from_parameter_search_space(
         parameter_search_space
@@ -1151,7 +1151,7 @@ def resume_tuning(
     settings_values.update(overrides)
     settings = TuningSettings(**settings_values)
     space = load_parameter_search_space(output_path / "configspace.json", seed=settings.seed)
-    space._ksptuneinitial_solver_configurations = previous_run["initial_solver_configurations"]
+    space._ksptune_initial_solver_configurations = previous_run["initial_solver_configurations"]
     run = prepare_tuning(
         settings,
         space,
