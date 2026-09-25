@@ -11,8 +11,8 @@ After the snapshots are exported, a python interface runs an optimisation on the
 
 We observed substantial speedups over default parameters on cardiac simulation using the monodomain, bidomain, and EMI model, but the method is general and can be applied to any PETSc solver.
 
-[Documentation](https://joegreiner.github.io/KSPTune/) 
-[Installation](https://joegreiner.github.io/KSPTune/installation/)  [openCARP step-by-step example](https://joegreiner.github.io/KSPTune/opencarp/) 
+[Documentation](https://joegreiner.github.io/KSPTune/) /
+[Installation](https://joegreiner.github.io/KSPTune/installation/) / [openCARP step-by-step example](https://joegreiner.github.io/KSPTune/opencarp/) /
 [Parameter files](https://joegreiner.github.io/KSPTune/parameter-files/)
 
 # Experiments: speedups over default parameters
