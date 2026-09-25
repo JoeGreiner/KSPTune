@@ -1,0 +1,45 @@
+[project]
+site_name = "KSPTune"
+site_description = "Bayesian optimization for PETSc KSP solvers."
+site_url = "https://joegreiner.github.io/KSPTune/"
+repo_url = "https://github.com/JoeGreiner/KSPTune"
+extra_css = ["assets/extra.css"]
+nav = [
+  { "Home" = "index.md" },
+  { "Why KSPTune?" = "why-ksptune.md" },
+  { "Installation" = "installation.md" },
+  { "Example: openCARP" = "opencarp.md" },
+  { "Tuning output" = "tuning-output.md" },
+  { "Parameter files" = "parameter-files.md" },
+  { "Citation" = "citation.md" },
+]
+
+[project.theme]
+variant = "modern"
+language = "en"
+font = false
+logo = "assets/KSPTune-logo.svg"
+favicon = "assets/KSPTune-logo.svg"
+
+[[project.theme.palette]]
+media = "(prefers-color-scheme)"
+primary = "teal"
+accent = "teal"
+toggle.icon = "lucide/sun-moon"
+toggle.name = "Switch to light mode"
+
+[[project.theme.palette]]
+media = "(prefers-color-scheme: light)"
+scheme = "default"
+primary = "teal"
+accent = "teal"
+toggle.icon = "lucide/sun"
+toggle.name = "Switch to dark mode"
+
+[[project.theme.palette]]
+media = "(prefers-color-scheme: dark)"
+scheme = "slate"
+primary = "teal"
+accent = "teal"
+toggle.icon = "lucide/moon"
+toggle.name = "Switch to system preference"

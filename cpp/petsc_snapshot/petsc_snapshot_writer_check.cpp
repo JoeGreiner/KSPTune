@@ -1,40 +1,61 @@
-#include "ksptune/petsc_snapshot_writer.hpp"
+#include "ksptune/petsc_snapshot.hpp"
 
-#include <petscksp.h>
-
-#include <iostream>
+#include <cstdlib>
+#include <dirent.h>
+#include <fstream>
+#include <map>
+#include <set>
 #include <string>
-#include <utility>
 
 namespace {
 
-PetscErrorCode check_step_selection()
+std::set<std::string> snapshot_files(const std::string& directory)
 {
-  if(!ksptune::petsc_snapshot::ShouldWriteSnapshotForStep("", 0)) return PETSC_ERR_PLIB;
-  if(!ksptune::petsc_snapshot::ShouldWriteSnapshotForStep("all", 7)) return PETSC_ERR_PLIB;
-  if(!ksptune::petsc_snapshot::ShouldWriteSnapshotForStep("*", 3)) return PETSC_ERR_PLIB;
-  if(!ksptune::petsc_snapshot::ShouldWriteSnapshotForStep("0, 2, 5", 2)) {
-    return PETSC_ERR_PLIB;
+  std::set<std::string> files;
+  DIR* entries = opendir(directory.c_str());
+  if(!entries) return files;
+  while(const auto* entry = readdir(entries)) {
+    const std::string name = entry->d_name;
+    if(name.compare(0, 2, "s_") == 0 &&
+       name.size() > 4 && name.compare(name.size() - 4, 4, ".txt") == 0) {
+      files.insert(directory + "/" + name);
+    }
   }
-  if(ksptune::petsc_snapshot::ShouldWriteSnapshotForStep("0, 2, 5", 4)) return PETSC_ERR_PLIB;
-  return 0;
+  closedir(entries);
+  return files;
 }
 
-PetscErrorCode check_safe_snapshot_file_prefix()
+PetscErrorCode check_snapshots(const std::string& directory,
+                              const std::set<std::string>& previous_files)
 {
-  using ksptune::petsc_snapshot::SafeSnapshotFilePrefix;
-
-  if(SafeSnapshotFilePrefix("elliptic PDE (PETSc)") != "elliptic_pde_petsc") {
-    return PETSC_ERR_PLIB;
+  std::set<int> indices;
+  std::set<std::string> matrices;
+  int count = 0;
+  for(const auto& file : snapshot_files(directory)) {
+    if(previous_files.count(file)) continue;
+    std::ifstream input(file);
+    std::map<std::string, std::string> metadata;
+    std::string line;
+    while(std::getline(input, line)) {
+      const auto separator = line.find('=');
+      if(separator != std::string::npos) {
+        metadata[line.substr(0, separator)] = line.substr(separator + 1);
+      }
+    }
+    PetscCheck(metadata["solve_index"] == "0" || metadata["solve_index"] == "2",
+               PETSC_COMM_SELF, PETSC_ERR_PLIB, "Unexpected exported solve index");
+    indices.insert(std::stoi(metadata["solve_index"]));
+    matrices.insert(metadata["A"]);
+    PetscCheck(metadata["matrix_write"] == (metadata["solve_index"] == "0" ? "written" : "reused"),
+               PETSC_COMM_SELF, PETSC_ERR_PLIB, "Expected reuse of the unchanged matrix");
+    for(const char* key : {"A", "matrix_metadata", "b", "x0"}) {
+      PetscCheck(!metadata[key].empty() && std::ifstream(directory + "/" + metadata[key]).good(),
+                 PETSC_COMM_SELF, PETSC_ERR_PLIB, "Missing snapshot file: %s", key);
+    }
+    ++count;
   }
-  if(SafeSnapshotFilePrefix("  parab//solver  ") != "parab_solver") {
-    return PETSC_ERR_PLIB;
-  }
-  if(SafeSnapshotFilePrefix("***") != "ksp") return PETSC_ERR_PLIB;
-  if(ksptune::petsc_snapshot::SafeSnapshotFilePrefixFromPath("meshes/rmtest-6x5x4-trimmed-veri-nosmall") !=
-     "rmtest_6x5x4_trimmed_veri_nosmall") {
-    return PETSC_ERR_PLIB;
-  }
+  PetscCheck(count == 2 && indices.size() == 2 && matrices.size() == 1,
+             PETSC_COMM_SELF, PETSC_ERR_PLIB, "Expected solves 0 and 2 sharing one matrix");
   return 0;
 }
 
@@ -88,79 +109,29 @@ PetscErrorCode create_test_system(MPI_Comm mpi_communicator,
 int main(int argc, char** argv)
 {
   PetscCall(PetscInitialize(&argc, &argv, nullptr, nullptr));
-  PetscCall(check_step_selection());
-  PetscCall(check_safe_snapshot_file_prefix());
-
-  char output_dir[PETSC_MAX_PATH_LEN] = ".";
-  PetscBool found_output_dir = PETSC_FALSE;
-  PetscCall(PetscOptionsGetString(nullptr,
-                                  nullptr,
-                                  "-snapshot_output_dir",
-                                  output_dir,
-                                  sizeof(output_dir),
-                                  &found_output_dir));
-  const std::string output_directory = found_output_dir ? output_dir : ".";
-
-  Mat system_matrix = nullptr;
-  Vec right_hand_side_vector = nullptr;
-  Vec initial_guess_vector = nullptr;
-  PetscCall(create_test_system(
-      PETSC_COMM_WORLD,
-      &system_matrix,
-      &right_hand_side_vector,
-      &initial_guess_vector));
-
-  ksptune::petsc_snapshot::KspSnapshotRequest first;
-  first.mpi_communicator = PETSC_COMM_WORLD;
-  first.output_directory = output_directory;
-  first.snapshot_file_prefix =
-      ksptune::petsc_snapshot::SafeSnapshotFilePrefixFromPath("meshes/rmtest-6x5x4-trimmed-veri-nosmall");
-  first.snapshot_index = 0;
-  first.system_matrix = system_matrix;
-  first.right_hand_side_vector = right_hand_side_vector;
-  first.initial_guess_vector = initial_guess_vector;
-  first.extra_metadata_entries = {{"label", "check"}, {"solver_name", "cg"}};
-
-  ksptune::petsc_snapshot::KspSnapshotResult first_result;
-  PetscCall(ksptune::petsc_snapshot::WriteKspSnapshot(first, &first_result));
-
-  ksptune::petsc_snapshot::KspSnapshotRequest second = first;
-  second.snapshot_index = 1;
-
-  ksptune::petsc_snapshot::KspSnapshotResult second_result;
-  PetscCall(ksptune::petsc_snapshot::WriteKspSnapshot(second, &second_result));
-
-  ksptune::petsc_snapshot::PetscKspSnapshotExport skipped_export;
-  skipped_export.mpi_communicator = PETSC_COMM_WORLD;
-  skipped_export.solve_indices = "0";
-  skipped_export.snapshot_file_prefix =
-      ksptune::petsc_snapshot::SafeSnapshotFilePrefixFromPath("meshes/rmtest-6x5x4-trimmed-veri-nosmall");
-  skipped_export.system_matrix = system_matrix;
-  skipped_export.right_hand_side_vector = right_hand_side_vector;
-  skipped_export.initial_guess_vector = initial_guess_vector;
-  PetscCall(ksptune::petsc_snapshot::WritePetscKspSnapshotIfRequested(
-      skipped_export,
-      nullptr));
-
-  ksptune::petsc_snapshot::KspSnapshotResult requested_result;
-  ksptune::petsc_snapshot::PetscKspSnapshotExport requested_export = skipped_export;
-  requested_export.snapshot_directory = output_directory;
-  requested_export.metadata_entries.push_back(std::make_pair(
-      "meshname",
-      "meshes/rmtest-6x5x4-trimmed-veri-nosmall"));
-  PetscCall(ksptune::petsc_snapshot::WritePetscKspSnapshotIfRequested(
-      requested_export,
-      &requested_result));
-
+  const char* output_directory = std::getenv("KSPTUNE_SNAPSHOT_DIR");
+  PetscCheck(output_directory && *output_directory, PETSC_COMM_WORLD, PETSC_ERR_USER_INPUT,
+             "Set KSPTUNE_SNAPSHOT_DIR and enable export for solves 0,2");
   int rank = 0;
-  MPI_Comm_rank(PETSC_COMM_WORLD, &rank);
-  if(rank == 0) {
-    std::cout << second_result.metadata_file_path << '\n';
-  }
+  PetscCallMPI(MPI_Comm_rank(PETSC_COMM_WORLD, &rank));
+  const auto previous_files = rank == 0 ? snapshot_files(output_directory) : std::set<std::string>();
 
-  PetscCall(VecDestroy(&initial_guess_vector));
-  PetscCall(VecDestroy(&right_hand_side_vector));
-  PetscCall(MatDestroy(&system_matrix));
+  Mat matrix = nullptr;
+  Vec b = nullptr, x = nullptr;
+  PetscCall(create_test_system(PETSC_COMM_WORLD, &matrix, &b, &x));
+  KSP ksp = nullptr;
+  PetscCall(KSPCreate(PETSC_COMM_WORLD, &ksp));
+  PetscCall(KSPSetOperators(ksp, matrix, matrix));
+  for(int solve = 0; solve < 3; ++solve) PetscCall(KSPTuneExport(ksp, b, x));
+
+  PetscErrorCode check_error = rank == 0 ? check_snapshots(output_directory, previous_files) : 0;
+  PetscCallMPI(MPI_Bcast(&check_error, 1, MPI_INT, 0, PETSC_COMM_WORLD));
+  PetscCall(check_error);
+
+  PetscCall(KSPDestroy(&ksp));
+  PetscCall(VecDestroy(&x));
+  PetscCall(VecDestroy(&b));
+  PetscCall(MatDestroy(&matrix));
   PetscCall(PetscFinalize());
   return 0;
 }

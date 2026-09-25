@@ -1,28 +1,21 @@
 from __future__ import annotations
 
-import json
 from pathlib import Path
 from typing import Any
 
 import yaml
 
-
-def load_trial_records(tuning_run_directory: str | Path) -> list[dict[str, Any]]:
-    path = Path(tuning_run_directory) / "solver_configuration_trials.jsonl"
-    if not path.exists():
-        raise ValueError(f"No solver_configuration_trials.jsonl found in {tuning_run_directory}")
-    records: list[dict[str, Any]] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        if line.strip():
-            records.append(json.loads(line))
-    return records
+from .trial_records import load_trial_records
 
 
 def analyze_parameter_importance(
     tuning_run_directory: str | Path,
     output_path: str | Path | None = None,
 ) -> dict[str, Any]:
-    records = load_trial_records(tuning_run_directory)
+    trials_path = Path(tuning_run_directory) / "solver_configuration_trials.jsonl"
+    if not trials_path.exists():
+        raise ValueError(f"No solver_configuration_trials.jsonl found in {tuning_run_directory}")
+    records = load_trial_records(trials_path)
     if len(records) < 2:
         result = {
             "method": "insufficient-data",
@@ -50,7 +43,6 @@ def analyze_parameter_importance(
             "method": "random-forest-feature-importance",
             "trial_count": len(records),
             "parameter_importance": importances,
-            "note": "fANOVA can be added on top of the same trial file once runhistory export is stable.",
         }
 
     if output_path is None:
@@ -59,4 +51,3 @@ def analyze_parameter_importance(
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(yaml.safe_dump(result, sort_keys=False), encoding="utf-8")
     return result
-

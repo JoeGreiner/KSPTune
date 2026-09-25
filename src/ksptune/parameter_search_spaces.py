@@ -6,6 +6,8 @@ import json
 from pathlib import Path
 from typing import Any
 
+from .file_io import atomic_text_file
+
 
 def list_builtin_parameter_search_spaces() -> list[str]:
     from .builtin_parameter_search_spaces import BUILTIN_PARAMETER_SEARCH_SPACES
@@ -155,13 +157,15 @@ def build_configspace_from_parameter_search_space(parameter_search_space: Any, s
 def write_configspace_json(configuration_space: Any, output_path: str | Path) -> None:
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    configuration_space.to_json(path, indent=2)
+    with atomic_text_file(path) as handle:
+        configuration_space.to_json(handle, indent=2)
 
 
 def write_configspace_yaml(configuration_space: Any, output_path: str | Path) -> None:
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    configuration_space.to_yaml(path, sort_keys=False)
+    with atomic_text_file(path) as handle:
+        configuration_space.to_yaml(handle, sort_keys=False)
 
 
 def parameter_search_space_to_yaml(parameter_search_space: Any) -> str:

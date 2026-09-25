@@ -2,18 +2,25 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import json
 import os
 import re
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
+from .file_io import atomic_text_file
+
 SNAPSHOT_COLLECTION_COLUMNS = [
+    "snapshot_id",
     "solve_index",
+    "matrix_key",
     "A",
+    "matrix_metadata",
     "b",
     "x0",
     "meta",
+    "matrix_write",
     "rows",
     "cols",
     "rhs_size",
@@ -27,9 +34,62 @@ SNAPSHOT_COLLECTION_COLUMNS = [
     "rhs_nullspace_component_removed",
 ]
 
-DUMP_FILE_RE = re.compile(
-    r"^(?P<prefix>.+)__solve_(?P<solve_index>[0-9]{6})__(?P<kind>A|b|x0)\.bin$"
-)
+SNAPSHOT_PATH_COLUMNS = {
+    "A": "matrix_file_path",
+    "matrix_metadata": "matrix_metadata_file_path",
+    "b": "right_hand_side_file_path",
+    "x0": "initial_guess_file_path",
+    "meta": "metadata_file_path",
+}
+
+SHA256_HEX_RE = re.compile(r"^[0-9a-fA-F]{64}$")
+
+
+def matrix_hash_path(matrix_path: Path) -> Path:
+    return matrix_path.with_name(f"{matrix_path.name}.sha256")
+
+
+def matrix_file_signature(matrix_path: Path) -> dict[str, int]:
+    stat = matrix_path.stat()
+    return {
+        "size": stat.st_size,
+        "mtime_ns": stat.st_mtime_ns,
+        "ctime_ns": stat.st_ctime_ns,
+        "device": stat.st_dev,
+        "inode": stat.st_ino,
+    }
+
+
+def read_matrix_hash(matrix_path: Path) -> str | None:
+    hash_path = matrix_hash_path(matrix_path)
+    if not hash_path.exists():
+        return None
+    try:
+        cached = json.loads(hash_path.read_text(encoding="utf-8"))
+        if not isinstance(cached, dict) or cached.get("signature") != matrix_file_signature(
+            matrix_path
+        ):
+            return None
+        matrix_hash = cached.get("sha256")
+    except (ValueError, OSError, UnicodeDecodeError):
+        return None
+    if not isinstance(matrix_hash, str) or not SHA256_HEX_RE.fullmatch(matrix_hash):
+        return None
+    print(f"[snapshot_collections] using cached matrix hash: {hash_path}", flush=True)
+    return matrix_hash.lower()
+
+
+def write_matrix_hash(matrix_path: Path, matrix_hash: str, signature: dict[str, int]) -> None:
+    hash_path = matrix_hash_path(matrix_path)
+    try:
+        with atomic_text_file(hash_path) as handle:
+            json.dump({"sha256": matrix_hash, "signature": signature}, handle)
+            handle.write("\n")
+    except OSError as exc:
+        print(
+            f"[snapshot_collections] warning: could not write matrix hash cache {hash_path}: {exc}",
+            flush=True,
+        )
 
 
 def read_snapshot_metadata(metadata_file_path: str | Path) -> dict[str, str]:
@@ -63,32 +123,6 @@ def metadata_text(metadata: dict[str, str], key: str, default: str = "") -> str:
     return value
 
 
-def metadata_nullspace_kind(metadata: dict[str, str]) -> str:
-    kind = metadata_text(metadata, "nullspace_kind", "")
-    if kind:
-        return kind
-    return "unknown" if metadata_int(metadata, "nullspace", 0) else "none"
-
-
-def infer_size_from_ownership_ranges(metadata: dict[str, str], key: str) -> int:
-    raw = metadata.get(key, "")
-    if not raw:
-        return 0
-    try:
-        values = [int(item) for item in raw.split(",") if item != ""]
-    except ValueError:
-        return 0
-    return values[-1] if values else 0
-
-
-def infer_mpi_size_from_ownership_ranges(metadata: dict[str, str]) -> int:
-    raw = metadata.get("row_ownership_ranges", "")
-    if not raw:
-        return metadata_int(metadata, "mpi_size", 1)
-    values = [item for item in raw.split(",") if item != ""]
-    return max(1, len(values) - 1)
-
-
 def relative_path(path: Path | None, base_directory: Path) -> str:
     if path is None:
         return ""
@@ -96,41 +130,7 @@ def relative_path(path: Path | None, base_directory: Path) -> str:
 
 
 def resolve_snapshot_file_path(path_text: str, base_directory: Path) -> str:
-    if path_text == "":
-        return ""
-
-    path = Path(path_text)
-    if path.is_absolute():
-        return str(path)
-
-    snapshot_collectionrelative_path = base_directory / path
-    if snapshot_collectionrelative_path.exists():
-        return str(snapshot_collectionrelative_path.resolve())
-
-    working_directoryrelative_path = Path.cwd() / path
-    if working_directoryrelative_path.exists():
-        return str(working_directoryrelative_path.resolve())
-
-    return str(snapshot_collectionrelative_path)
-
-
-def metadata_file_for_group(dump_directory: Path, prefix: str, solve_index: int) -> Path | None:
-    metadata_file = dump_directory / f"{prefix}__solve_{solve_index:06d}__metadata.txt"
-    return metadata_file if metadata_file.exists() else None
-
-
-def find_snapshot_file_groups(dump_directory: str | Path) -> dict[tuple[Path, str, int], dict[str, Path]]:
-    directory = Path(dump_directory)
-    groups: dict[tuple[Path, str, int], dict[str, Path]] = {}
-    for path in directory.rglob("*"):
-        if not path.is_file():
-            continue
-        match = DUMP_FILE_RE.match(path.name)
-        if match is None:
-            continue
-        key = (path.parent.resolve(), match.group("prefix"), int(match.group("solve_index")))
-        groups.setdefault(key, {})[match.group("kind")] = path
-    return groups
+    return str((base_directory / path_text).resolve()) if path_text else ""
 
 
 def snapshot_collection_rows_from_directory(
@@ -140,67 +140,56 @@ def snapshot_collection_rows_from_directory(
 ) -> list[dict[str, Any]]:
     if not dump_directory.is_dir():
         raise ValueError(f"Snapshot directory does not exist: {dump_directory}")
-
-    groups = find_snapshot_file_groups(dump_directory)
-    if not groups:
-        raise ValueError(f"No PETSc snapshot files found in {dump_directory}")
+    metadata_files = sorted(path for path in dump_directory.glob("s_*.txt") if path.is_file())
+    if not metadata_files:
+        raise ValueError(f"No snapshot metadata (s_*.txt) found in {dump_directory}")
 
     incomplete: list[str] = []
     rows: list[dict[str, Any]] = []
-    for (snapshot_directory, prefix, solve_index), files in sorted(groups.items(), key=lambda item: item[0]):
-        missing = [kind for kind in ("A", "b", "x0") if kind not in files]
-        if missing:
-            incomplete.append(f"{prefix}__solve_{solve_index:06d}: missing {', '.join(missing)}")
+    for metadata_file in metadata_files:
+        metadata = read_snapshot_metadata(metadata_file)
+        required_paths = {key: metadata.get(key, "") for key in ("A", "matrix_metadata", "b", "x0")}
+        missing_keys = [key for key, value in required_paths.items() if not value]
+        if missing_keys:
+            incomplete.append(f"{metadata_file.name}: missing {', '.join(missing_keys)}")
             continue
 
-        metadata_file = metadata_file_for_group(snapshot_directory, prefix, solve_index)
-        metadata = read_snapshot_metadata(metadata_file) if metadata_file else {}
-        row_count = metadata_int(metadata, "rows") or infer_size_from_ownership_ranges(
-            metadata, "row_ownership_ranges"
-        )
-        column_count = metadata_int(metadata, "cols", row_count)
-        right_hand_side_size = metadata_int(
-            metadata, "rhs_size"
-        ) or infer_size_from_ownership_ranges(metadata, "rhs_ownership_ranges")
+        referenced_paths = {key: metadata_file.parent / value for key, value in required_paths.items()}
+        missing_files = [f"{key}={path}" for key, path in referenced_paths.items() if not path.is_file()]
+        if missing_files:
+            incomplete.append(f"{metadata_file.name}: missing referenced files: {', '.join(missing_files)}")
+            continue
 
+        matrix_metadata = read_snapshot_metadata(referenced_paths["matrix_metadata"])
+        combined_metadata = {**matrix_metadata, **metadata}
         rows.append(
             {
-                "solve_index": solve_index,
-                "A": relative_path(files["A"], base_directory),
-                "b": relative_path(files["b"], base_directory),
-                "x0": relative_path(files["x0"], base_directory),
+                "snapshot_id": metadata.get("snapshot_id") or metadata_file.stem.removeprefix("s_"),
+                "solve_index": metadata_int(metadata, "solve_index"),
+                "matrix_key": metadata_text(combined_metadata, "matrix_key"),
+                **{key: relative_path(path, base_directory) for key, path in referenced_paths.items()},
                 "meta": relative_path(metadata_file, base_directory),
-                "rows": row_count,
-                "cols": column_count,
-                "rhs_size": right_hand_side_size,
-                "mpi_size": infer_mpi_size_from_ownership_ranges(metadata),
-                "matrix_nullspace_attached": metadata_int(
-                    metadata,
-                    "matrix_nullspace_attached",
-                    metadata_int(metadata, "nullspace", 0),
-                ),
-                "transpose_nullspace_attached": metadata_int(
-                    metadata,
-                    "transpose_nullspace_attached",
-                    0,
-                ),
-                "near_nullspace_attached": metadata_int(metadata, "near_nullspace_attached", 0),
-                "nullspace_kind": metadata_nullspace_kind(metadata),
-                "nullspace_field_index": metadata_int(metadata, "nullspace_field_index", -1),
-                "nullspace_block_size": metadata_int(metadata, "nullspace_block_size", 0),
+                "matrix_write": metadata_text(metadata, "matrix_write"),
+                "rows": metadata_int(combined_metadata, "rows"),
+                "cols": metadata_int(combined_metadata, "cols"),
+                "rhs_size": metadata_int(combined_metadata, "rhs_size"),
+                "mpi_size": metadata_int(combined_metadata, "mpi_size", 1),
+                "matrix_nullspace_attached": metadata_int(combined_metadata, "matrix_nullspace_attached"),
+                "transpose_nullspace_attached": metadata_int(combined_metadata, "transpose_nullspace_attached"),
+                "near_nullspace_attached": metadata_int(combined_metadata, "near_nullspace_attached"),
+                "nullspace_kind": metadata_text(combined_metadata, "nullspace_kind", "none"),
+                "nullspace_field_index": metadata_int(combined_metadata, "nullspace_field_index", -1),
+                "nullspace_block_size": metadata_int(combined_metadata, "nullspace_block_size"),
                 "rhs_nullspace_component_removed": metadata_text(
-                    metadata,
-                    "rhs_nullspace_component_removed",
-                    "unknown",
+                    combined_metadata, "rhs_nullspace_component_removed", "unknown"
                 ),
             }
         )
 
     if incomplete:
         details = "\n".join(f"  - {item}" for item in incomplete)
-        raise ValueError(f"Incomplete snapshot groups:\n{details}")
-
-    return rows
+        raise ValueError(f"Incomplete snapshot metadata:\n{details}")
+    return sorted(rows, key=lambda row: int(row["solve_index"]))
 
 
 def create_snapshot_collection_from_directory(
@@ -211,69 +200,68 @@ def create_snapshot_collection_from_directory(
 ) -> Path:
     directory = Path(dump_directory).resolve()
 
-    collection_path = Path(output_path) if output_path is not None else directory / "snapshot_collection.csv"
+    collection_path = (
+        Path(output_path) if output_path is not None else directory / "snapshot_collection.csv"
+    )
     collection_path = collection_path.resolve()
     if collection_path.exists() and not overwrite:
         raise ValueError(f"Snapshot CSV already exists: {collection_path}")
 
-    rows = snapshot_collection_rows_from_directory(
-        dump_directory=directory,
-        base_directory=collection_path.parent,
+    return write_snapshot_collection(
+        load_snapshots_from_directory(directory),
+        collection_path,
+        relative_paths=True,
     )
-
-    collection_path.parent.mkdir(parents=True, exist_ok=True)
-    with collection_path.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=SNAPSHOT_COLLECTION_COLUMNS)
-        writer.writeheader()
-        writer.writerows(rows)
-    return collection_path
 
 
 def load_snapshots_from_directory(dump_directory: str | Path) -> list[dict[str, Any]]:
     directory = Path(dump_directory).resolve()
-    scratch_collection_path = directory / "snapshot_collection.csv"
     rows = snapshot_collection_rows_from_directory(
         dump_directory=directory,
-        base_directory=scratch_collection_path.parent,
+        base_directory=directory,
     )
-    return [normalize_snapshot_collection_row(row, scratch_collection_path.parent) for row in rows]
+    return [normalize_snapshot_collection_row(row, directory) for row in rows]
 
 
-def normalize_snapshot_collection_row(row: dict[str, str], base_directory: Path) -> dict[str, Any]:
-    matrix_path = row.get("A") or row.get("matrix_file_path") or row.get("mat_file") or ""
-    right_hand_side_path = row.get("b") or row.get("right_hand_side_file_path") or row.get("rhs_file") or ""
-    initial_guess_path = row.get("x0") or row.get("initial_guess_file_path") or ""
-    metadata_path = row.get("meta") or row.get("metadata_file_path") or row.get("meta_file") or ""
+def normalize_snapshot_collection_row(row: dict[str, Any], base_directory: Path) -> dict[str, Any]:
+    missing = [key for key in ("solve_index", *SNAPSHOT_PATH_COLUMNS) if row.get(key) in (None, "")]
+    if missing:
+        raise ValueError(f"Snapshot row missing required fields: {', '.join(missing)}")
 
-    matrix_nullspace_attached = int(
-        float(row.get("matrix_nullspace_attached") or row.get("nullspace") or 0)
+    metadata_path = Path(resolve_snapshot_file_path(row["meta"], base_directory))
+    snapshot_id = (
+        row.get("snapshot_id")
+        or read_snapshot_metadata(metadata_path).get("snapshot_id")
+        or metadata_path.stem.removeprefix("s_")
     )
+    matrix_nullspace_attached = int(float(row.get("matrix_nullspace_attached") or 0))
     transpose_nullspace_attached = int(float(row.get("transpose_nullspace_attached") or 0))
     near_nullspace_attached = int(float(row.get("near_nullspace_attached") or 0))
     nullspace_attached = (
-        matrix_nullspace_attached
-        or transpose_nullspace_attached
-        or near_nullspace_attached
+        matrix_nullspace_attached or transpose_nullspace_attached or near_nullspace_attached
     )
-    nullspace_kind = row.get("nullspace_kind") or (
-        "unknown" if int(float(row.get("nullspace") or 0)) else "none"
-    )
+    nullspace_kind = row.get("nullspace_kind") or ("unknown" if nullspace_attached else "none")
 
     return {
+        "snapshot_id": snapshot_id,
         "solve_index": int(row.get("solve_index") or 0),
-        "matrix_file_path": resolve_snapshot_file_path(matrix_path, base_directory),
-        "right_hand_side_file_path": resolve_snapshot_file_path(right_hand_side_path, base_directory),
-        "initial_guess_file_path": resolve_snapshot_file_path(initial_guess_path, base_directory),
-        "metadata_file_path": resolve_snapshot_file_path(metadata_path, base_directory),
+        "matrix_key": row.get("matrix_key") or "",
+        **{
+            key: resolve_snapshot_file_path(row[column], base_directory)
+            for column, key in SNAPSHOT_PATH_COLUMNS.items()
+        },
+        "matrix_write": row.get("matrix_write") or "",
         "rows": int(float(row.get("rows") or 0)),
         "cols": int(float(row.get("cols") or 0)),
-        "right_hand_side_size": int(float(row.get("rhs_size") or row.get("right_hand_side_size") or 0)),
+        "right_hand_side_size": int(float(row.get("rhs_size") or 0)),
         "mpi_size": int(float(row.get("mpi_size") or 1)),
         "matrix_nullspace_attached": matrix_nullspace_attached,
         "transpose_nullspace_attached": transpose_nullspace_attached,
         "near_nullspace_attached": near_nullspace_attached,
         "nullspace_kind": nullspace_kind,
-        "nullspace_field_index": int(float(row.get("nullspace_field_index") or -1)),
+        "nullspace_field_index": int(float(row["nullspace_field_index"]))
+        if row.get("nullspace_field_index") not in (None, "")
+        else -1,
         "nullspace_block_size": int(float(row.get("nullspace_block_size") or 0)),
         "rhs_nullspace_component_removed": row.get("rhs_nullspace_component_removed") or "unknown",
         "nullspace": int(bool(nullspace_attached)),
@@ -291,7 +279,12 @@ def load_snapshot_collection(snapshot_collection_path: str | Path) -> list[dict[
 
 
 def file_sha256(path: Path) -> str:
+    cached_hash = read_matrix_hash(path)
+    if cached_hash is not None:
+        return cached_hash
+
     digest = hashlib.sha256()
+    signature = matrix_file_signature(path)
     print(f"[snapshot_collections] hashing matrix file: {path}", flush=True)
     chunk_size = 16 * 1024 * 1024
     total_bytes = 0
@@ -299,11 +292,15 @@ def file_sha256(path: Path) -> str:
         for chunk in iter(lambda: handle.read(chunk_size), b""):
             total_bytes += len(chunk)
             digest.update(chunk)
+    if matrix_file_signature(path) != signature:
+        raise ValueError(f"Matrix file changed while hashing: {path}")
     print(
         f"[snapshot_collections] done hashing: {path} ({total_bytes / (1024 * 1024):.2f} MiB)",
         flush=True,
     )
-    return digest.hexdigest()
+    matrix_hash = digest.hexdigest()
+    write_matrix_hash(path, matrix_hash, signature)
+    return matrix_hash
 
 
 def canonical_matrix_paths(rows: list[dict[str, Any]]) -> dict[str, str]:
@@ -331,15 +328,14 @@ def canonical_matrix_paths(rows: list[dict[str, Any]]) -> dict[str, str]:
         flush=True,
     )
     if not candidate_groups:
-        print("[snapshot_collections] deduplication complete: no duplicate matrices detected", flush=True)
+        print(
+            "[snapshot_collections] deduplication complete: no duplicate matrices detected",
+            flush=True,
+        )
         return {}
 
     paths_to_hash = list(
-        dict.fromkeys(
-            path_text
-            for _, _, _, paths in candidate_groups
-            for path_text in paths
-        )
+        dict.fromkeys(path_text for _, _, _, paths in candidate_groups for path_text in paths)
     )
     print(
         f"[snapshot_collections] hashing {len(paths_to_hash)} unique candidate files in parallel",
@@ -349,7 +345,9 @@ def canonical_matrix_paths(rows: list[dict[str, Any]]) -> dict[str, str]:
     path_hashes: dict[str, str] = {}
     max_workers = min(len(paths_to_hash), max(1, os.cpu_count() or 1), 8)
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        for path_text, matrix_hash in zip(paths_to_hash, executor.map(file_sha256, map(Path, paths_to_hash))):
+        for path_text, matrix_hash in zip(
+            paths_to_hash, executor.map(file_sha256, map(Path, paths_to_hash))
+        ):
             path_hashes[path_text] = matrix_hash
 
     canonical_paths: dict[str, str] = {}
@@ -367,7 +365,10 @@ def canonical_matrix_paths(rows: list[dict[str, Any]]) -> dict[str, str]:
             canonical_paths[path_text] = first_path_by_hash.setdefault(dedupe_key, path_text)
 
     if not canonical_paths:
-        print("[snapshot_collections] deduplication complete: no duplicate matrices detected", flush=True)
+        print(
+            "[snapshot_collections] deduplication complete: no duplicate matrices detected",
+            flush=True,
+        )
     return canonical_paths
 
 
@@ -379,43 +380,46 @@ def deduplicate_matrix_rows(rows: list[dict[str, Any]]) -> None:
             row["A"] = canonical_paths[matrix_path]
 
 
+def write_snapshot_collection(
+    snapshots: list[dict[str, Any]],
+    output_path: str | Path,
+    *,
+    relative_paths: bool = False,
+    deduplicate_matrices: bool = False,
+) -> Path:
+    output = Path(output_path).resolve()
+    output.parent.mkdir(parents=True, exist_ok=True)
+    aliases = {**SNAPSHOT_PATH_COLUMNS, "rhs_size": "right_hand_side_size"}
+    rows = [
+        {column: snapshot[aliases.get(column, column)] for column in SNAPSHOT_COLLECTION_COLUMNS}
+        for snapshot in snapshots
+    ]
+    if deduplicate_matrices:
+        deduplicate_matrix_rows(rows)
+    if relative_paths:
+        for row in rows:
+            for column in SNAPSHOT_PATH_COLUMNS:
+                row[column] = relative_path(
+                    Path(row[column]) if row[column] else None, output.parent
+                )
+    with atomic_text_file(output) as handle:
+        writer = csv.DictWriter(handle, fieldnames=SNAPSHOT_COLLECTION_COLUMNS)
+        writer.writeheader()
+        writer.writerows(rows)
+    return output
+
+
 def write_resolved_snapshot_collection(
     snapshot_collection_path: str | Path,
     output_path: str | Path,
     *,
     deduplicate_matrices: bool = True,
 ) -> Path:
-    output = Path(output_path).resolve()
-    output.parent.mkdir(parents=True, exist_ok=True)
-    snapshots = load_snapshot_collection(snapshot_collection_path)
-    rows = [
-        {
-            "solve_index": snapshot["solve_index"],
-            "A": snapshot["matrix_file_path"],
-            "b": snapshot["right_hand_side_file_path"],
-            "x0": snapshot["initial_guess_file_path"],
-            "meta": snapshot["metadata_file_path"],
-            "rows": snapshot["rows"],
-            "cols": snapshot["cols"],
-            "rhs_size": snapshot["right_hand_side_size"],
-            "mpi_size": snapshot["mpi_size"],
-            "matrix_nullspace_attached": snapshot["matrix_nullspace_attached"],
-            "transpose_nullspace_attached": snapshot["transpose_nullspace_attached"],
-            "near_nullspace_attached": snapshot["near_nullspace_attached"],
-            "nullspace_kind": snapshot["nullspace_kind"],
-            "nullspace_field_index": snapshot["nullspace_field_index"],
-            "nullspace_block_size": snapshot["nullspace_block_size"],
-            "rhs_nullspace_component_removed": snapshot["rhs_nullspace_component_removed"],
-        }
-        for snapshot in snapshots
-    ]
-    if deduplicate_matrices:
-        deduplicate_matrix_rows(rows)
-    with output.open("w", encoding="utf-8", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=SNAPSHOT_COLLECTION_COLUMNS)
-        writer.writeheader()
-        writer.writerows(rows)
-    return output
+    return write_snapshot_collection(
+        load_snapshot_collection(snapshot_collection_path),
+        output_path,
+        deduplicate_matrices=deduplicate_matrices,
+    )
 
 
 def validate_snapshot_collection(snapshot_collection_path: str | Path) -> list[str]:
@@ -432,13 +436,21 @@ def validate_snapshot_collection(snapshot_collection_path: str | Path) -> list[s
     for snapshot in snapshots:
         solve_index = snapshot["solve_index"]
 
-        for key in ("matrix_file_path", "right_hand_side_file_path", "initial_guess_file_path"):
-            file_path = Path(snapshot[key])
-            if not file_path.exists():
+        for key in (
+            "matrix_file_path",
+            "matrix_metadata_file_path",
+            "right_hand_side_file_path",
+            "initial_guess_file_path",
+        ):
+            file_path_text = snapshot.get(key, "")
+            if file_path_text and not Path(file_path_text).exists():
+                file_path = Path(file_path_text)
                 errors.append(f"solve_index {solve_index}: missing {key} {file_path}")
         metadata_file_path = snapshot.get("metadata_file_path", "")
         if metadata_file_path and not Path(metadata_file_path).exists():
-            errors.append(f"solve_index {solve_index}: missing metadata_file_path {metadata_file_path}")
+            errors.append(
+                f"solve_index {solve_index}: missing metadata_file_path {metadata_file_path}"
+            )
 
     if not snapshots:
         errors.append(f"Snapshot CSV is empty: {path}")

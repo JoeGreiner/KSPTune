@@ -1,29 +1,3 @@
-# KSPTune: Bayesian Optimization for PETSc KSP Solvers
-
-<p align="center">
-  <img src="docs/assets/KSPTune-logo.svg" alt="KSPTune logo" width="200" height="185">
-</p>
-
-KSPTune is a tool to tune [PETSc](https://petsc.org/release/) solver and preconditioner parameters using the bayesian optimisation package [SMAC3](https://jmlr.org/papers/v23/21-0888.html).
-We provide a header-only C++ library that can be used to easily export snapshots (Matrix, initial guess, rhs vector, ownership ranges, etc.) of the solver state to be tuned.
-With this, it can be easily integrated into existing PETSc applications, such as [openCARP](https://git.opencarp.org/openCARP/openCARP) or [CEPS](https://carmen.gitlabpages.inria.fr/ceps/).
-After the snapshots are exported, a python interface runs an optimisation on the snapshots on user-configured parameterspaces. It is compatible with HPC systems/SLURM.
-
-We observed substantial speedups over default parameters on cardiac simulation using the monodomain, bidomain, and EMI model, but the method is general and can be applied to any PETSc solver.
-
-[Documentation](https://joegreiner.github.io/KSPTune/) ·
-[Installation](docs/installation.md) · [openCARP step-by-step example](docs/opencarp.md) ·
-[Parameter files](docs/parameter-files.md)
-
-# Experiments: speedups over default parameters
-
-These speedups depend, of course, on the problem size and the solver configuration.
-Especially algebraic multigrid methods (gamg, hypre boomeramg) have many important parameters that can be tuned.
-
-* Monodomain, atrial simulations: 1.7x speedup (tuned: CG+SPAI, default: bjacobi+ilu+cg, openCARP)
-* Bidomain, synthetic cube geometry with conductivity hetereogeneity: 11.2x speedup (tuned: fgmres/fieldsplit hupre AMG, default: bjacobi+ilu+cg, CEPS)
-* EMI, synthetic myocyte meshes: 4.0x speedup (tuned: fgmres+hypre AMG, default: hypre AMG + cg)
-
 # Citation
 
 If you find KSPTune useful in your research, please consider citing the following articles:

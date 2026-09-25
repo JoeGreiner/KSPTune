@@ -1,0 +1,145 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink"
+     width="742" height="686" viewBox="153 155 742 686"
+     class="ink" role="img" aria-labelledby="logo-title logo-description">
+  <title id="logo-title">KSPTune</title>
+  <desc id="logo-description">KSPTune: three large notes extending beyond the heart.</desc>
+  <defs>
+    <style>
+      .ink { color: #05070a; }
+      .light { color: #edf3f8; }
+    </style>
+    <!-- SegmentPuzzler heart. -->
+    <path id="heart-shape" d="M 512 799.20
+             C 457.28 761.46 200.65 615.72 189.32 416.14
+             C 181.78 289.23 287.45 223.16 391.23 238.71
+             C 445.75 247.15 480.50 279.50 498.50 324.50
+             C 504.50 337 509 345 512 348
+             C 515 345 519.50 337 525.50 324.50
+             C 543.50 279.50 578.25 247.15 632.77 238.71
+             C 736.55 223.16 842.23 289.23 834.68 416.14
+             C 823.36 615.72 566.72 761.46 512 799.20
+             Z"/>
+    <clipPath id="heart-clip"><use xlink:href="#heart-shape"/></clipPath>
+    <g id="melody-notes" stroke-linejoin="round">
+      <path id="note-1" d="M 368.6 553.7 L 368.6 395 Q 368.6 383.5 380.1 383.5 Q 391.6 383.5 391.6 395 L 391.6 572.1 C 391.6 604.3 352.5 636.5 313.4 650.3 C 274.3 664.1 246.7 650.3 251.3 622.7 C 255.9 592.8 290.4 562.9 329.5 551.4 C 345.6 546.8 359.4 546.8 368.6 549.1 Z"/>
+      <path id="note-2" d="M 557.6 463.7 L 557.6 305 Q 557.6 293.5 569.1 293.5 Q 580.6 293.5 580.6 305 L 580.6 482.1 C 580.6 514.3 541.5 546.5 502.4 560.3 C 463.3 574.1 435.7 560.3 440.3 532.7 C 444.9 502.8 479.4 472.9 518.5 461.4 C 534.6 456.8 548.4 456.8 557.6 459.1 Z"/>
+      <path id="note-3" d="M 773.6 348.7 L 773.6 190 Q 773.6 178.5 785.1 178.5 Q 796.6 178.5 796.6 190 L 796.6 367.1 C 796.6 399.3 757.5 431.5 718.4 445.3 C 679.3 459.1 651.7 445.3 656.3 417.7 C 660.9 387.8 695.4 357.9 734.5 346.4 C 750.6 341.8 764.4 341.8 773.6 344.1 Z"/>
+      <path id="eighth-note-flag" d="M 782.8 192.3 C 808.1 226.8 854.1 238.3 867.9 279.7 C 881.7 318.8 854.1 360.2 833.4 369.4 C 854.1 334.9 847.2 314.2 819.6 300.4 L 782.8 272.8 Z"/>
+    </g>
+  </defs>
+  <g id="heart-content" clip-path="url(#heart-clip)">
+    <use xlink:href="#heart-shape" fill="#dddddd"/>
+    <!-- ParaView Cool to Warm, reversed. -->
+    <g id="activation-mesh">
+      <path id="element-01" fill="#f08c6e" d="M 87 172 L 203 162 L 127 272 Z"/>
+      <path id="element-02" fill="#f5c4ad" d="M 203 162 L 229 267 L 127 272 Z"/>
+      <path id="element-03" fill="#e3d9d3" d="M 203 162 L 341 148 L 229 267 Z"/>
+      <path id="element-04" fill="#ebd3c6" d="M 341 148 L 372 273 L 229 267 Z"/>
+      <path id="element-05" fill="#aac7fc" d="M 341 148 L 433 151 L 372 273 Z"/>
+      <path id="element-06" fill="#bdd1f6" d="M 433 151 L 494 266 L 372 273 Z"/>
+      <path id="element-07" fill="#5b7ae4" d="M 433 151 L 572 156 L 494 266 Z"/>
+      <path id="element-08" fill="#6585ec" d="M 572 156 L 594 281 L 494 266 Z"/>
+      <path id="element-09" fill="#4e67d6" d="M 572 156 L 691 172 L 594 281 Z"/>
+      <path id="element-10" fill="#3b4cc0" d="M 691 172 L 734 259 L 594 281 Z"/>
+      <path id="element-11" fill="#3b4cc0" d="M 691 172 L 829 153 L 734 259 Z"/>
+      <path id="element-12" fill="#3b4cc0" d="M 829 153 L 852 260 L 734 259 Z"/>
+      <path id="element-13" fill="#3b4cc0" d="M 829 153 L 928 172 L 852 260 Z"/>
+      <path id="element-14" fill="#3b4cc0" d="M 928 172 L 963 276 L 852 260 Z"/>
+      <path id="element-15" fill="#ed8467" d="M 127 272 L 229 267 L 222 349 Z"/>
+      <path id="element-16" fill="#d1493e" d="M 127 272 L 222 349 L 98 385 Z"/>
+      <path id="element-17" fill="#f1cab7" d="M 229 267 L 372 273 L 348 365 Z"/>
+      <path id="element-18" fill="#f6baa0" d="M 229 267 L 348 365 L 222 349 Z"/>
+      <path id="element-19" fill="#a8c5fd" d="M 372 273 L 494 266 L 463 372 Z"/>
+      <path id="element-20" fill="#e5d7d0" d="M 372 273 L 463 372 L 348 365 Z"/>
+      <path id="element-21" fill="#6585ec" d="M 494 266 L 594 281 L 589 378 Z"/>
+      <path id="element-22" fill="#bdd1f6" d="M 494 266 L 589 378 L 463 372 Z"/>
+      <path id="element-23" fill="#3b4cc0" d="M 594 281 L 734 259 L 691 363 Z"/>
+      <path id="element-24" fill="#5976e1" d="M 594 281 L 691 363 L 589 378 Z"/>
+      <path id="element-25" fill="#3b4cc0" d="M 734 259 L 852 260 L 821 366 Z"/>
+      <path id="element-26" fill="#3b4cc0" d="M 734 259 L 821 366 L 691 363 Z"/>
+      <path id="element-27" fill="#3b4cc0" d="M 852 260 L 963 276 L 914 385 Z"/>
+      <path id="element-28" fill="#3b4cc0" d="M 852 260 L 914 385 L 821 366 Z"/>
+      <path id="element-29" fill="#c0222f" d="M 98 385 L 222 349 L 144 489 Z"/>
+      <path id="element-30" fill="#c83836" d="M 222 349 L 256 489 L 144 489 Z"/>
+      <path id="element-31" fill="#f7b599" d="M 222 349 L 348 365 L 256 489 Z"/>
+      <path id="element-32" fill="#f6b99e" d="M 348 365 L 372 492 L 256 489 Z"/>
+      <path id="element-33" fill="#f5c3ac" d="M 348 365 L 463 372 L 372 492 Z"/>
+      <path id="element-34" fill="#f5c3ab" d="M 463 372 L 498 467 L 372 492 Z"/>
+      <path id="element-35" fill="#d7dce3" d="M 463 372 L 589 378 L 498 467 Z"/>
+      <path id="element-36" fill="#9bbbfe" d="M 589 378 L 619 457 L 498 467 Z"/>
+      <path id="element-37" fill="#7193f3" d="M 589 378 L 691 363 L 619 457 Z"/>
+      <path id="element-38" fill="#789bf7" d="M 691 363 L 701 468 L 619 457 Z"/>
+      <path id="element-39" fill="#4a61d2" d="M 691 363 L 821 366 L 701 468 Z"/>
+      <path id="element-40" fill="#506bd9" d="M 821 366 L 817 458 L 701 468 Z"/>
+      <path id="element-41" fill="#3b4cc0" d="M 821 366 L 914 385 L 817 458 Z"/>
+      <path id="element-42" fill="#3b4cc0" d="M 914 385 L 960 471 L 817 458 Z"/>
+      <path id="element-43" fill="#b40426" d="M 144 489 L 256 489 L 237 594 Z"/>
+      <path id="element-44" fill="#b40426" d="M 144 489 L 237 594 L 120 582 Z"/>
+      <path id="element-45" fill="#d24a3f" d="M 256 489 L 372 492 L 345 567 Z"/>
+      <path id="element-46" fill="#b50627" d="M 256 489 L 345 567 L 237 594 Z"/>
+      <path id="element-47" fill="#f6bca2" d="M 372 492 L 498 467 L 469 573 Z"/>
+      <path id="element-48" fill="#e46d55" d="M 372 492 L 469 573 L 345 567 Z"/>
+      <path id="element-49" fill="#e0dbd9" d="M 498 467 L 619 457 L 556 558 Z"/>
+      <path id="element-50" fill="#eed0c1" d="M 498 467 L 556 558 L 469 573 Z"/>
+      <path id="element-51" fill="#8eb1fe" d="M 619 457 L 701 468 L 674 573 Z"/>
+      <path id="element-52" fill="#c4d5f2" d="M 619 457 L 674 573 L 556 558 Z"/>
+      <path id="element-53" fill="#5672de" d="M 701 468 L 817 458 L 803 574 Z"/>
+      <path id="element-54" fill="#789bf7" d="M 701 468 L 803 574 L 674 573 Z"/>
+      <path id="element-55" fill="#3c4ec1" d="M 817 458 L 960 471 L 906 572 Z"/>
+      <path id="element-56" fill="#506ad9" d="M 817 458 L 906 572 L 803 574 Z"/>
+      <path id="element-57" fill="#b40426" d="M 120 582 L 237 594 L 128 699 Z"/>
+      <path id="element-58" fill="#b40426" d="M 237 594 L 249 694 L 128 699 Z"/>
+      <path id="element-59" fill="#b40426" d="M 237 594 L 345 567 L 249 694 Z"/>
+      <path id="element-60" fill="#be1e2e" d="M 345 567 L 377 671 L 249 694 Z"/>
+      <path id="element-61" fill="#cc4039" d="M 345 567 L 469 573 L 377 671 Z"/>
+      <path id="element-62" fill="#d24b3f" d="M 469 573 L 475 689 L 377 671 Z"/>
+      <path id="element-63" fill="#f7b195" d="M 469 573 L 556 558 L 475 689 Z"/>
+      <path id="element-64" fill="#f6b69b" d="M 556 558 L 590 688 L 475 689 Z"/>
+      <path id="element-65" fill="#ead4c8" d="M 556 558 L 674 573 L 590 688 Z"/>
+      <path id="element-66" fill="#ecd3c5" d="M 674 573 L 731 697 L 590 688 Z"/>
+      <path id="element-67" fill="#a6c4fd" d="M 674 573 L 803 574 L 731 697 Z"/>
+      <path id="element-68" fill="#c4d5f2" d="M 803 574 L 858 696 L 731 697 Z"/>
+      <path id="element-69" fill="#87aafc" d="M 803 574 L 906 572 L 858 696 Z"/>
+      <path id="element-70" fill="#5d7ce5" d="M 906 572 L 975 664 L 858 696 Z"/>
+      <path id="element-71" fill="#b40426" d="M 128 699 L 249 694 L 240 776 Z"/>
+      <path id="element-72" fill="#b40426" d="M 128 699 L 240 776 L 95 771 Z"/>
+      <path id="element-73" fill="#b40426" d="M 249 694 L 377 671 L 316 782 Z"/>
+      <path id="element-74" fill="#b40426" d="M 249 694 L 316 782 L 240 776 Z"/>
+      <path id="element-75" fill="#b40426" d="M 377 671 L 475 689 L 444 804 Z"/>
+      <path id="element-76" fill="#b40426" d="M 377 671 L 444 804 L 316 782 Z"/>
+      <path id="element-77" fill="#da5b48" d="M 475 689 L 590 688 L 570 803 Z"/>
+      <path id="element-78" fill="#ca3b37" d="M 475 689 L 570 803 L 444 804 Z"/>
+      <path id="element-79" fill="#f1cbb8" d="M 590 688 L 731 697 L 702 795 Z"/>
+      <path id="element-80" fill="#f08d6f" d="M 590 688 L 702 795 L 570 803 Z"/>
+      <path id="element-81" fill="#d1dae8" d="M 731 697 L 858 696 L 796 781 Z"/>
+      <path id="element-82" fill="#f6bba1" d="M 731 697 L 796 781 L 702 795 Z"/>
+      <path id="element-83" fill="#b2cbfa" d="M 858 696 L 975 664 L 910 796 Z"/>
+      <path id="element-84" fill="#e1dad6" d="M 858 696 L 910 796 L 796 781 Z"/>
+      <path id="element-85" fill="#b40426" d="M 95 771 L 240 776 L 136 901 Z"/>
+      <path id="element-86" fill="#b40426" d="M 240 776 L 230 872 L 136 901 Z"/>
+      <path id="element-87" fill="#b40426" d="M 240 776 L 316 782 L 230 872 Z"/>
+      <path id="element-88" fill="#b40426" d="M 316 782 L 383 880 L 230 872 Z"/>
+      <path id="element-89" fill="#b40426" d="M 316 782 L 444 804 L 383 880 Z"/>
+      <path id="element-90" fill="#b40426" d="M 444 804 L 473 890 L 383 880 Z"/>
+      <path id="element-91" fill="#b40426" d="M 444 804 L 570 803 L 473 890 Z"/>
+      <path id="element-92" fill="#b40426" d="M 570 803 L 598 873 L 473 890 Z"/>
+      <path id="element-93" fill="#cd413a" d="M 570 803 L 702 795 L 598 873 Z"/>
+      <path id="element-94" fill="#e7745a" d="M 702 795 L 701 891 L 598 873 Z"/>
+      <path id="element-95" fill="#f6bca2" d="M 702 795 L 796 781 L 701 891 Z"/>
+      <path id="element-96" fill="#f6bfa6" d="M 796 781 L 841 903 L 701 891 Z"/>
+      <path id="element-97" fill="#edd2c4" d="M 796 781 L 910 796 L 841 903 Z"/>
+      <path id="element-98" fill="#dfdcda" d="M 910 796 L 946 878 L 841 903 Z"/>
+    </g>
+    <path id="mesh-edges" d="M 87 172 L 203 162 M 127 272 L 203 162 M 87 172 L 127 272 M 203 162 L 229 267 M 127 272 L 229 267 M 203 162 L 341 148 M 229 267 L 341 148 M 341 148 L 372 273 M 229 267 L 372 273 M 341 148 L 433 151 M 372 273 L 433 151 M 433 151 L 494 266 M 372 273 L 494 266 M 433 151 L 572 156 M 494 266 L 572 156 M 572 156 L 594 281 M 494 266 L 594 281 M 572 156 L 691 172 M 594 281 L 691 172 M 691 172 L 734 259 M 594 281 L 734 259 M 691 172 L 829 153 M 734 259 L 829 153 M 829 153 L 852 260 M 734 259 L 852 260 M 829 153 L 928 172 M 852 260 L 928 172 M 928 172 L 963 276 M 852 260 L 963 276 M 222 349 L 229 267 M 127 272 L 222 349 M 98 385 L 222 349 M 98 385 L 127 272 M 348 365 L 372 273 M 229 267 L 348 365 M 222 349 L 348 365 M 463 372 L 494 266 M 372 273 L 463 372 M 348 365 L 463 372 M 589 378 L 594 281 M 494 266 L 589 378 M 463 372 L 589 378 M 691 363 L 734 259 M 594 281 L 691 363 M 589 378 L 691 363 M 821 366 L 852 260 M 734 259 L 821 366 M 691 363 L 821 366 M 914 385 L 963 276 M 852 260 L 914 385 M 821 366 L 914 385 M 144 489 L 222 349 M 98 385 L 144 489 M 222 349 L 256 489 M 144 489 L 256 489 M 256 489 L 348 365 M 348 365 L 372 492 M 256 489 L 372 492 M 372 492 L 463 372 M 463 372 L 498 467 M 372 492 L 498 467 M 498 467 L 589 378 M 589 378 L 619 457 M 498 467 L 619 457 M 619 457 L 691 363 M 691 363 L 701 468 M 619 457 L 701 468 M 701 468 L 821 366 M 817 458 L 821 366 M 701 468 L 817 458 M 817 458 L 914 385 M 914 385 L 960 471 M 817 458 L 960 471 M 237 594 L 256 489 M 144 489 L 237 594 M 120 582 L 237 594 M 120 582 L 144 489 M 345 567 L 372 492 M 256 489 L 345 567 M 237 594 L 345 567 M 469 573 L 498 467 M 372 492 L 469 573 M 345 567 L 469 573 M 556 558 L 619 457 M 498 467 L 556 558 M 469 573 L 556 558 M 674 573 L 701 468 M 619 457 L 674 573 M 556 558 L 674 573 M 803 574 L 817 458 M 701 468 L 803 574 M 674 573 L 803 574 M 906 572 L 960 471 M 817 458 L 906 572 M 803 574 L 906 572 M 128 699 L 237 594 M 120 582 L 128 699 M 237 594 L 249 694 M 128 699 L 249 694 M 249 694 L 345 567 M 345 567 L 377 671 M 249 694 L 377 671 M 377 671 L 469 573 M 469 573 L 475 689 M 377 671 L 475 689 M 475 689 L 556 558 M 556 558 L 590 688 M 475 689 L 590 688 M 590 688 L 674 573 M 674 573 L 731 697 M 590 688 L 731 697 M 731 697 L 803 574 M 803 574 L 858 696 M 731 697 L 858 696 M 858 696 L 906 572 M 906 572 L 975 664 M 858 696 L 975 664 M 240 776 L 249 694 M 128 699 L 240 776 M 95 771 L 240 776 M 95 771 L 128 699 M 316 782 L 377 671 M 249 694 L 316 782 M 240 776 L 316 782 M 444 804 L 475 689 M 377 671 L 444 804 M 316 782 L 444 804 M 570 803 L 590 688 M 475 689 L 570 803 M 444 804 L 570 803 M 702 795 L 731 697 M 590 688 L 702 795 M 570 803 L 702 795 M 796 781 L 858 696 M 731 697 L 796 781 M 702 795 L 796 781 M 910 796 L 975 664 M 858 696 L 910 796 M 796 781 L 910 796 M 136 901 L 240 776 M 95 771 L 136 901 M 230 872 L 240 776 M 136 901 L 230 872 M 230 872 L 316 782 M 316 782 L 383 880 M 230 872 L 383 880 M 383 880 L 444 804 M 444 804 L 473 890 M 383 880 L 473 890 M 473 890 L 570 803 M 570 803 L 598 873 M 473 890 L 598 873 M 598 873 L 702 795 M 701 891 L 702 795 M 598 873 L 701 891 M 701 891 L 796 781 M 796 781 L 841 903 M 701 891 L 841 903 M 841 903 L 910 796 M 910 796 L 946 878 M 841 903 L 946 878"
+          fill="none" stroke="currentColor" stroke-width="2.8" stroke-linejoin="round"/>
+  </g>
+  <g id="heart-outline" fill="none" stroke-linejoin="miter" stroke-miterlimit="3">
+    <use xlink:href="#heart-shape" stroke="currentColor" stroke-width="52"/>
+    <use class="light" xlink:href="#heart-shape" stroke="currentColor" stroke-width="24"/>
+  </g>
+  <g id="foreground-notes">
+      <use class="light" xlink:href="#melody-notes" fill="currentColor" stroke="currentColor" stroke-width="26"/>
+      <use xlink:href="#melody-notes" fill="currentColor"/>
+  </g>
+</svg>

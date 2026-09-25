@@ -11,13 +11,13 @@ from typing import Any
 
 import yaml
 
+from .file_io import write_text_atomic
 from .nullspaces import parse_nullspace
 from .replay import replay_environment
 from .snapshot_collections import (
-    create_snapshot_collection_from_directory,
     load_snapshots_from_directory,
-    summarize_snapshot_directory,
-    write_resolved_snapshot_collection,
+    summarize_snapshots,
+    write_snapshot_collection,
 )
 
 SNAPSHOT_ANALYSIS_BINARY_NAME = "ksptune-petsc-snapshot-analysis"
@@ -26,9 +26,7 @@ SNAPSHOT_ANALYSIS_BINARY_NAME = "ksptune-petsc-snapshot-analysis"
 def find_default_petsc_snapshot_analysis_binary() -> Path | None:
     project_root = Path(__file__).resolve().parents[2]
     local_binary = (
-        project_root
-        / "build/cpp/petsc_snapshot_analysis"
-        / SNAPSHOT_ANALYSIS_BINARY_NAME
+        project_root / "build/cpp/petsc_snapshot_analysis" / SNAPSHOT_ANALYSIS_BINARY_NAME
     )
     if local_binary.exists():
         return local_binary.resolve()
@@ -82,6 +80,7 @@ def build_petsc_snapshot_analysis_command(
     mpi_processes: int = 1,
     nullspace: str | None = "none",
     solve_index: int | None = None,
+    snapshot_id: str | None = None,
     rhs_compatibility_tolerance: float = 1.0e-10,
     nullspace_residual_tolerance: float = 1.0e-10,
 ) -> list[str]:
@@ -96,6 +95,10 @@ def build_petsc_snapshot_analysis_command(
         "-analysis_nullspace_residual_tolerance",
         str(nullspace_residual_tolerance),
     ]
+    if solve_index is not None and snapshot_id is not None:
+        raise ValueError("Select either snapshot_id or solve_index, not both.")
+    if snapshot_id is not None:
+        analysis_command.extend(["-analysis_snapshot_id", snapshot_id])
     if solve_index is not None:
         analysis_command.extend(["-analysis_solve_target", str(solve_index)])
     analysis_command.extend(snapshot_analysis_nullspace_options(nullspace))
@@ -115,6 +118,7 @@ def run_petsc_snapshot_analysis(
     threads_per_rank: int = 1,
     nullspace: str | None = "none",
     solve_index: int | None = None,
+    snapshot_id: str | None = None,
     rhs_compatibility_tolerance: float = 1.0e-10,
     nullspace_residual_tolerance: float = 1.0e-10,
 ) -> dict[str, Any]:
@@ -129,6 +133,7 @@ def run_petsc_snapshot_analysis(
         mpi_processes=mpi_processes,
         nullspace=nullspace,
         solve_index=solve_index,
+        snapshot_id=snapshot_id,
         rhs_compatibility_tolerance=rhs_compatibility_tolerance,
         nullspace_residual_tolerance=nullspace_residual_tolerance,
     )
@@ -181,13 +186,26 @@ def analyze_snapshots(
     threads_per_rank: int = 1,
     nullspace: str | None = "none",
     solve_index: int | None = None,
+    snapshot_id: str | None = None,
     rhs_compatibility_tolerance: float = 1.0e-10,
     nullspace_residual_tolerance: float = 1.0e-10,
     metadata_only: bool = False,
 ) -> dict[str, Any]:
     directory = Path(snapshot_directory).resolve()
     snapshots = load_snapshots_from_directory(directory)
-    summary = summarize_snapshot_directory(directory)
+    if solve_index is not None and snapshot_id is not None:
+        raise ValueError("Select either snapshot_id or solve_index, not both.")
+    if snapshot_id is not None or solve_index is not None:
+        key, value = (
+            ("snapshot_id", snapshot_id) if snapshot_id is not None else ("solve_index", solve_index)
+        )
+        snapshots = [snapshot for snapshot in snapshots if snapshot[key] == value]
+        if len(snapshots) != 1:
+            raise ValueError(
+                f"Expected one snapshot for {key}={value}, found {len(snapshots)}. "
+                "Use a unique snapshot_id."
+            )
+    summary = summarize_snapshots(snapshots)
     rows = [snapshot["rows"] for snapshot in snapshots if snapshot["rows"]]
     cols = [snapshot["cols"] for snapshot in snapshots if snapshot["cols"]]
 
@@ -225,14 +243,15 @@ def analyze_snapshots(
                 ),
             }
         else:
-            snapshot_collection_path = create_snapshot_collection_from_directory(
-                directory,
+            snapshot_collection_path = write_snapshot_collection(
+                snapshots,
                 analysis_output_directory / "snapshot_analysis_collection.csv",
-                overwrite=True,
+                relative_paths=True,
             )
-            resolved_snapshot_collection_path = write_resolved_snapshot_collection(
-                snapshot_collection_path,
+            resolved_snapshot_collection_path = write_snapshot_collection(
+                snapshots,
                 analysis_output_directory / "snapshot_analysis_collection.resolved.csv",
+                deduplicate_matrices=True,
             )
             result["snapshot_collection_path"] = str(snapshot_collection_path.resolve())
             result["resolved_snapshot_collection_path"] = str(
@@ -247,11 +266,12 @@ def analyze_snapshots(
                 threads_per_rank=threads_per_rank,
                 nullspace=nullspace,
                 solve_index=solve_index,
+                snapshot_id=snapshot_id,
                 rhs_compatibility_tolerance=rhs_compatibility_tolerance,
                 nullspace_residual_tolerance=nullspace_residual_tolerance,
             )
 
     if output_file_path is not None:
         output_file_path.parent.mkdir(parents=True, exist_ok=True)
-        output_file_path.write_text(yaml.safe_dump(result, sort_keys=False), encoding="utf-8")
+        write_text_atomic(output_file_path, yaml.safe_dump(result, sort_keys=False))
     return result

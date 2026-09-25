@@ -1,20 +1,67 @@
 #include <petscksp.h>
+#include "json_io.hpp"
+#include "snapshot_io.hpp"
+#include "replay_cache.hpp"
+
+#if defined(__has_include)
+#if __has_include(<HYPRE_utilities.h>)
+#include <HYPRE_utilities.h>
+#define KSPTUNE_HAS_HYPRE_UTILITIES 1
+#endif
+#endif
+
+#ifndef KSPTUNE_HAS_HYPRE_UTILITIES
+#define KSPTUNE_HAS_HYPRE_UTILITIES 0
+#endif
+
+#if defined(__has_include)
+#if __has_include(<petsc/private/kspimpl.h>)
+#include <petsc/private/kspimpl.h>
+#define KSPTUNE_HAS_PETSC_PRIVATE_KSPIMPL 1
+#endif
+#endif
+
+#ifndef KSPTUNE_HAS_PETSC_PRIVATE_KSPIMPL
+#define KSPTUNE_HAS_PETSC_PRIVATE_KSPIMPL 0
+#endif
 
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <map>
 #include <numeric>
 #include <sstream>
 #include <string>
-#include <sys/resource.h>
 #include <vector>
 
+#if defined(__APPLE__) && defined(__MACH__)
+#include <mach/mach.h>
+#endif
+
+#if defined(__linux__)
+#include <unistd.h>
+#endif
+
 namespace {
+
+using ksptune::json;
+using ksptune::snapshot;
+using ksptune::read_snapshot_collection;
+using ksptune::load_matrix_binary;
+using ksptune::petsc_matrix;
+using ksptune::petsc_vector;
+using ksptune::petsc_ksp;
+using ksptune::petsc_nullspace;
+using ksptune::ksp_setup_context;
+using ksptune::replay_cache;
+using ksptune::matrix_memory_mb;
+using ksptune::trim;
 
 #define KSPTUNE_PETSC_CALL(call) \
   do { \
@@ -26,19 +73,24 @@ struct replay_args {
   std::string snapshot_collection_path;
   std::string json_output_path;
   std::string initial_guess_vector_path;
+  bool use_initial_guess = true;
   std::string nullspace_mode = "from-metadata";
   std::string nullspace_actions = "default";
   std::string petsc_options_key;
   int repeat = 1;
   int warmup = 0;
   int solve_target = -1;
+  std::string snapshot_id;
   bool constant_nullspace = false;
   int field_nullspace = -1;
   int field_nullspace_block_size = 2;
   bool diagnose_matrix = false;
   bool reuse_ksp_setup = true;
   bool replay_server = false;
+  bool options_help = false;
+  bool hypre_hierarchy_diagnostics = false;
   double cache_memory_mb = 0.0;
+  double soft_timeout_sec = -1.0;
 };
 
 struct nullspace_actions {
@@ -59,35 +111,6 @@ struct replay_nullspace_choice {
   int block_size = 0;
 };
 
-struct snapshot {
-  int solve_index = 0;
-  std::string matrix_file_path;
-  std::string right_hand_side_file_path;
-  std::string initial_guess_file_path;
-  std::string metadata_file_path;
-  PetscInt rows = 0;
-  PetscInt cols = 0;
-  PetscInt right_hand_side_size = 0;
-  int mpi_size = 1;
-  bool symmetric = false;
-  bool spd = false;
-  bool nullspace = false;
-  bool matrix_nullspace_attached = false;
-  bool transpose_nullspace_attached = false;
-  bool near_nullspace_attached = false;
-  std::string nullspace_kind = "none";
-  int nullspace_field_index = -1;
-  int nullspace_block_size = 0;
-  std::string rhs_nullspace_component_removed = "unknown";
-  double relative_tolerance = -1.0;
-  double absolute_tolerance = -1.0;
-  double divergence_tolerance = -1.0;
-  int max_iterations = -1;
-  std::vector<PetscInt> row_ownership_ranges;
-  std::vector<PetscInt> rhs_ownership_ranges;
-  std::vector<PetscInt> x0_ownership_ranges;
-};
-
 struct matrix_diagnostics {
   PetscInt row_count = 0;
   PetscInt column_count = 0;
@@ -96,19 +119,51 @@ struct matrix_diagnostics {
   double nonzero_count = 0.0;
   double allocated_nonzero_count = 0.0;
   double petsc_matrix_memory_bytes = 0.0;
+  double estimated_matrix_memory_bytes = 0.0;
   bool symmetric_tested = false;
   bool symmetric = false;
+};
+
+struct memory_sample {
+  std::string phase;
+  int solve_index = -1;
+  std::string snapshot_id;
+  double rss_mb_sum = 0.0;
+  double rss_mb_max_rank = 0.0;
+  double rss_mb_max_node = 0.0;
+};
+
+struct pc_diagnostic_level {
+  int level = 0;
+  int level_from_finest = 0;
+  std::map<std::string, double> metrics;
+  std::map<std::string, std::string> string_metrics;
+};
+
+struct pc_diagnostic_record {
+  std::string pc_type;
+  std::string setup_key;
+  int setup_index = 0;
+  std::map<std::string, double> metrics;
+  std::map<std::string, std::string> string_metrics;
+  std::vector<pc_diagnostic_level> levels;
 };
 
 struct step_result {
   int repeat_index = 0;
   int solve_index = 0;
+  std::string snapshot_id;
   double solve_time_sec = 0.0;
   double initial_true_residual_norm = 0.0;
   double rhs_norm = 0.0;
   double initial_true_relative_residual = 0.0;
   double final_true_residual_norm = 0.0;
   double final_true_relative_residual = 0.0;
+  double initial_ksp_residual_norm = 0.0;
+  double final_ksp_residual_norm = 0.0;
+  double ksp_rtol_reference_norm = 0.0;
+  double ksp_convergence_threshold_norm = 0.0;
+  double final_ksp_relative_residual_norm = 0.0;
   int iterations = 0;
   int reason_code = 0;
 };
@@ -117,9 +172,19 @@ struct replay_result {
   double objective_time_sec_median = 1.0e30;
   double total_wall_time_sec = 0.0;
   double matrix_load_time_sec = 0.0;
+  double matrix_prepare_time_sec = 0.0;
+  double vector_prepare_time_sec = 0.0;
+  double nullspace_time_sec = 0.0;
+  double true_residual_time_sec = 0.0;
+  bool use_initial_guess = true;
+  double soft_timeout_sec = -1.0;
+  double soft_timeout_elapsed_sec = 0.0;
+  bool soft_timeout_triggered = false;
   int matrix_cache_hits = 0;
   int matrix_cache_misses = 0;
   double replay_cache_memory_mb = 0.0;
+  double matrix_cache_memory_mb = 0.0;
+  double vector_cache_memory_mb = 0.0;
   double replay_cache_memory_limit_mb = 0.0;
   int replay_cache_evictions = 0;
   double solver_setup_time_sec = 0.0;
@@ -133,6 +198,8 @@ struct replay_result {
   double solve_time_sec_min = 0.0;
   double solve_time_sec_max = 0.0;
   double solve_time_sec_stddev = 0.0;
+  double solve_time_sec_sem = 0.0;
+  double solve_time_sec_relative_sem = 0.0;
   double solve_time_sec_range = 0.0;
   double solve_mpi_message_count = 0.0;
   double solve_mpi_message_bytes = 0.0;
@@ -142,11 +209,26 @@ struct replay_result {
   double initial_true_relative_residual_mean = 0.0;
   double final_true_residual_norm_mean = 0.0;
   double final_true_relative_residual_mean = 0.0;
-  std::vector<double> peak_memory_mb_per_rank;
-  double peak_memory_mb_max_per_rank = 0.0;
-  double peak_memory_mb_mean_per_rank = 0.0;
-  double peak_memory_mb_sum = 0.0;
-  int peak_memory_rank_count = 0;
+  double initial_ksp_residual_norm_mean = 0.0;
+  double final_ksp_residual_norm_mean = 0.0;
+  double ksp_rtol_reference_norm_mean = 0.0;
+  double ksp_convergence_threshold_norm_mean = 0.0;
+  double final_ksp_relative_residual_norm_mean = 0.0;
+  std::string ksp_residual_norm_type;
+  std::string ksp_rtol_reference_source;
+  double ksp_rtol = 0.0;
+  double ksp_atol = 0.0;
+  double ksp_dtol = 0.0;
+  int ksp_max_it = 0;
+  std::vector<memory_sample> memory_samples;
+  double rss_request_start_mb_sum = 0.0;
+  double rss_request_end_mb_sum = 0.0;
+  double rss_request_peak_sample_mb_sum = 0.0;
+  double rss_request_delta_mb_sum = 0.0;
+  double rss_setup_delta_mb_sum = 0.0;
+  double rss_solve_delta_mb_sum = 0.0;
+  double rss_peak_sample_mb_max_rank = 0.0;
+  double rss_peak_sample_mb_max_node = 0.0;
   double iterations_median = 0.0;
   double iterations_total = 0.0;
   bool converged = true;
@@ -169,8 +251,10 @@ struct replay_result {
   double rhs_nullspace_removed_component_relative_norm_max = 0.0;
   std::string ksp_type;
   std::string pc_type;
+  std::vector<pc_diagnostic_record> pc_diagnostics;
   std::vector<matrix_diagnostics> matrices;
   std::vector<step_result> steps;
+  std::vector<std::string> recorded_pc_diagnostic_keys;
 };
 
 struct replay_snapshot_plan {
@@ -180,29 +264,6 @@ struct replay_snapshot_plan {
   int matrix_cache_key_count = 0;
   std::string ksp_setup_cache_key;
   int ksp_setup_cache_key_count = 0;
-};
-
-struct ksp_setup_context {
-  Mat matrix = nullptr;
-  KSP ksp = nullptr;
-  double setup_time_sec = 0.0;
-  std::string ksp_type;
-  std::string pc_type;
-  std::string matrix_cache_key;
-  unsigned long last_used = 0;
-};
-
-struct vector_cache_context {
-  Vec vector = nullptr;
-  double memory_mb = 0.0;
-  unsigned long last_used = 0;
-};
-
-struct replay_cache_metadata {
-  unsigned long clock = 0;
-  std::map<std::string, double> matrix_memory_mb;
-  std::map<std::string, unsigned long> matrix_last_used;
-  int evictions = 0;
 };
 
 bool arg_value(int argc, char** argv, const std::string& key, std::string& value)
@@ -257,11 +318,13 @@ replay_args parse_args(int argc, char** argv)
   arg_value(argc, argv, "-snapshot_collection", args.snapshot_collection_path);
   arg_value(argc, argv, "-replay_json_out", args.json_output_path);
   arg_value(argc, argv, "-replay_initial_guess_vec", args.initial_guess_vector_path);
+  args.use_initial_guess = bool_arg(argc, argv, "-replay_use_initial_guess", true);
   arg_value(argc, argv, "-replay_nullspace", args.nullspace_mode);
   arg_value(argc, argv, "-replay_nullspace_actions", args.nullspace_actions);
   args.repeat = std::max(1, int_arg(argc, argv, "-replay_repeat", args.repeat));
   args.warmup = std::max(0, int_arg(argc, argv, "-replay_warmup", args.warmup));
   args.solve_target = int_arg(argc, argv, "-replay_solve_target", args.solve_target);
+  arg_value(argc, argv, "-replay_snapshot_id", args.snapshot_id);
   args.constant_nullspace = bool_arg(argc, argv, "-replay_constant_nullspace", false);
   if(args.constant_nullspace) args.nullspace_mode = "constant";
   if(args.nullspace_mode == "constant") args.constant_nullspace = true;
@@ -275,9 +338,20 @@ replay_args parse_args(int argc, char** argv)
   args.diagnose_matrix = bool_arg(argc, argv, "-replay_diagnose_matrix", false);
   args.reuse_ksp_setup = bool_arg(argc, argv, "-replay_reuse_ksp_setup", true);
   args.replay_server = bool_arg(argc, argv, "-replay_server", false);
+  args.options_help = bool_arg(argc, argv, "-replay_options_help", false);
+  args.hypre_hierarchy_diagnostics = bool_arg(
+      argc,
+      argv,
+      "-replay_hypre_hierarchy_diagnostics",
+      false);
   args.cache_memory_mb = std::max(
       0.0,
       double_arg(argc, argv, "-replay_cache_memory_mb", args.cache_memory_mb));
+  args.soft_timeout_sec = double_arg(
+      argc,
+      argv,
+      "-replay_soft_timeout_sec",
+      args.soft_timeout_sec);
   return args;
 }
 
@@ -287,9 +361,11 @@ void clear_replay_options()
     "-snapshot_collection",
     "-replay_json_out",
     "-replay_initial_guess_vec",
+    "-replay_use_initial_guess",
     "-replay_repeat",
     "-replay_warmup",
     "-replay_solve_target",
+    "-replay_snapshot_id",
     "-replay_nullspace",
     "-replay_nullspace_actions",
     "-replay_constant_nullspace",
@@ -298,7 +374,10 @@ void clear_replay_options()
     "-replay_diagnose_matrix",
     "-replay_reuse_ksp_setup",
     "-replay_server",
+    "-replay_options_help",
+    "-replay_hypre_hierarchy_diagnostics",
     "-replay_cache_memory_mb",
+    "-replay_soft_timeout_sec",
   };
   for(const char* key : keys) {
     PetscOptionsClearValue(nullptr, key);
@@ -314,8 +393,6 @@ std::string nullspace_description(const replay_args& args)
   return "none";
 }
 
-std::string trim(const std::string& text);
-std::string json_escape(const std::string& input);
 
 std::string lower_text(std::string text)
 {
@@ -523,340 +600,182 @@ PetscErrorCode build_replay_snapshot_plan(const replay_args& args,
   return 0;
 }
 
-std::string trim(const std::string& text)
+double matrix_memory_estimate_bytes(Mat matrix)
 {
-  size_t first = 0;
-  while(first < text.size() && std::isspace(static_cast<unsigned char>(text[first]))) ++first;
-  size_t last = text.size();
-  while(last > first && std::isspace(static_cast<unsigned char>(text[last - 1]))) --last;
-  return text.substr(first, last - first);
+  return matrix_memory_mb(matrix) * 1024.0 * 1024.0;
 }
 
-std::vector<std::string> split_csv_line(const std::string& line)
+#if defined(__linux__)
+double linux_status_memory_mb(const std::string& field_name)
 {
-  std::vector<std::string> fields;
-  std::string field;
-  bool in_quotes = false;
-  for(size_t i = 0; i < line.size(); ++i) {
-    const char c = line[i];
-    if(c == '"') {
-      if(in_quotes && i + 1 < line.size() && line[i + 1] == '"') {
-        field.push_back('"');
-        ++i;
-      } else {
-        in_quotes = !in_quotes;
-      }
-    } else if(c == ',' && !in_quotes) {
-      fields.push_back(trim(field));
-      field.clear();
-    } else {
-      field.push_back(c);
-    }
-  }
-  fields.push_back(trim(field));
-  return fields;
-}
-
-bool is_absolute_path(const std::string& path)
-{
-  return !path.empty() && (path[0] == '/' || (path.size() > 2 && path[1] == ':'));
-}
-
-bool file_exists(const std::string& path)
-{
-  std::ifstream input(path.c_str());
-  return input.good();
-}
-
-std::string dirname(const std::string& path)
-{
-  const std::string::size_type pos = path.find_last_of("/\\");
-  if(pos == std::string::npos) return ".";
-  if(pos == 0) return path.substr(0, 1);
-  return path.substr(0, pos);
-}
-
-std::string join_relative_to(const std::string& base_directory, const std::string& path)
-{
-  if(path.empty() || is_absolute_path(path)) return path;
-  if(base_directory.empty() || base_directory == ".") return path;
-  const std::string snapshot_collection_relative_path = base_directory + "/" + path;
-  if(file_exists(snapshot_collection_relative_path) || !file_exists(path)) {
-    return snapshot_collection_relative_path;
-  }
-  return path;
-}
-
-std::vector<PetscInt> parse_petsc_int_list(const std::string& text)
-{
-  std::vector<PetscInt> values;
-  std::stringstream stream(text);
-  std::string token;
-  while(std::getline(stream, token, ',')) {
-    token = trim(token);
-    if(!token.empty()) values.push_back(static_cast<PetscInt>(std::stoll(token)));
-  }
-  return values;
-}
-
-bool parse_bool(const std::string& text)
-{
-  std::string value = trim(text);
-  std::transform(value.begin(), value.end(), value.begin(), [](unsigned char c) {
-    return char(std::tolower(c));
-  });
-  return value == "1" || value == "true" || value == "yes" || value == "on";
-}
-
-int parse_int_or_default(const std::string& text, int default_value)
-{
-  if(trim(text).empty()) return default_value;
-  return std::atoi(text.c_str());
-}
-
-PetscInt parse_petsc_int_or_default(const std::string& text, PetscInt default_value)
-{
-  if(trim(text).empty()) return default_value;
-  return static_cast<PetscInt>(std::stoll(text));
-}
-
-double parse_double_or_default(const std::string& text, double default_value)
-{
-  if(trim(text).empty()) return default_value;
-  return std::atof(text.c_str());
-}
-
-void read_snapshot_metadata(snapshot& snap)
-{
-  if(snap.metadata_file_path.empty()) return;
-
-  std::ifstream input(snap.metadata_file_path.c_str());
+  std::ifstream status("/proc/self/status");
   std::string line;
-  while(std::getline(input, line)) {
-    const size_t equals = line.find('=');
-    if(equals == std::string::npos) continue;
-    const std::string key = trim(line.substr(0, equals));
-    const std::string value = trim(line.substr(equals + 1));
-    if(key == "row_ownership_ranges") snap.row_ownership_ranges = parse_petsc_int_list(value);
-    else if(key == "rhs_ownership_ranges") snap.rhs_ownership_ranges = parse_petsc_int_list(value);
-    else if(key == "x0_ownership_ranges") snap.x0_ownership_ranges = parse_petsc_int_list(value);
-    else if(key == "relative_tolerance") snap.relative_tolerance = std::atof(value.c_str());
-    else if(key == "absolute_tolerance") snap.absolute_tolerance = std::atof(value.c_str());
-    else if(key == "divergence_tolerance") snap.divergence_tolerance = std::atof(value.c_str());
-    else if(key == "max_iterations") snap.max_iterations = std::atoi(value.c_str());
-    else if(key == "symmetric") snap.symmetric = parse_bool(value);
-    else if(key == "spd") snap.spd = parse_bool(value);
-    else if(key == "matrix_nullspace_attached") snap.matrix_nullspace_attached = parse_bool(value);
-    else if(key == "transpose_nullspace_attached") {
-      snap.transpose_nullspace_attached = parse_bool(value);
+  while(std::getline(status, line)) {
+    if(line.rfind(field_name, 0) != 0) continue;
+    std::istringstream value_stream(line.substr(field_name.size()));
+    double value_kb = 0.0;
+    std::string unit;
+    value_stream >> value_kb >> unit;
+    if(value_stream) return value_kb / 1024.0;
+  }
+  return -1.0;
+}
+#endif
+
+double local_current_memory_mb()
+{
+#if defined(__APPLE__) && defined(__MACH__)
+  mach_task_basic_info info;
+  mach_msg_type_number_t count = MACH_TASK_BASIC_INFO_COUNT;
+  if(task_info(
+         mach_task_self(),
+         MACH_TASK_BASIC_INFO,
+         reinterpret_cast<task_info_t>(&info),
+         &count) != KERN_SUCCESS) {
+    return 0.0;
+  }
+  return double(info.resident_size) / (1024.0 * 1024.0);
+#elif defined(__linux__)
+  const double vmrss_mb = linux_status_memory_mb("VmRSS:");
+  if(vmrss_mb >= 0.0) return vmrss_mb;
+  std::ifstream statm("/proc/self/statm");
+  long size_pages = 0;
+  long resident_pages = 0;
+  statm >> size_pages >> resident_pages;
+  const long page_size = sysconf(_SC_PAGESIZE);
+  if(!statm || page_size <= 0) return 0.0;
+  return double(resident_pages) * double(page_size) / (1024.0 * 1024.0);
+#else
+  return 0.0;
+#endif
+}
+
+struct memory_tracker {
+  MPI_Comm communicator = PETSC_COMM_WORLD;
+  MPI_Comm node_communicator = MPI_COMM_NULL;
+  ~memory_tracker() { destroy(); }
+
+  PetscErrorCode initialize(MPI_Comm input_communicator)
+  {
+    communicator = input_communicator;
+    const int split_error = MPI_Comm_split_type(
+        communicator,
+        MPI_COMM_TYPE_SHARED,
+        0,
+        MPI_INFO_NULL,
+        &node_communicator);
+    return split_error == MPI_SUCCESS ? 0 : PETSC_ERR_LIB;
+  }
+
+  PetscErrorCode sample(replay_result& result,
+                        const std::string& phase,
+                        int solve_index = -1,
+                        const std::string& snapshot_id = "") const
+  {
+    memory_sample current_sample;
+    current_sample.phase = phase;
+    current_sample.solve_index = solve_index;
+    current_sample.snapshot_id = snapshot_id;
+
+    const double local_rss_mb = local_current_memory_mb();
+    double node_rss_mb_sum = local_rss_mb;
+    if(node_communicator != MPI_COMM_NULL) {
+      MPI_Allreduce(
+          MPI_IN_PLACE,
+          &node_rss_mb_sum,
+          1,
+          MPI_DOUBLE,
+          MPI_SUM,
+          node_communicator);
     }
-    else if(key == "near_nullspace_attached") snap.near_nullspace_attached = parse_bool(value);
-    else if(key == "nullspace_kind") snap.nullspace_kind = value.empty() ? "none" : value;
-    else if(key == "nullspace_field_index") snap.nullspace_field_index = std::atoi(value.c_str());
-    else if(key == "nullspace_block_size") snap.nullspace_block_size = std::atoi(value.c_str());
-    else if(key == "rhs_nullspace_component_removed") {
-      snap.rhs_nullspace_component_removed = value.empty() ? "unknown" : value;
-    }
-    else if(key == "nullspace") snap.matrix_nullspace_attached = parse_bool(value);
-    else if(key == "rows") snap.rows = parse_petsc_int_or_default(value, snap.rows);
-    else if(key == "cols") snap.cols = parse_petsc_int_or_default(value, snap.cols);
-    else if(key == "rhs_size") snap.right_hand_side_size =
-        parse_petsc_int_or_default(value, snap.right_hand_side_size);
-  }
-}
 
-std::string field_or_empty(const std::map<std::string, std::string>& row, const std::string& key)
-{
-  const auto found = row.find(key);
-  return found == row.end() ? "" : found->second;
-}
+    MPI_Allreduce(
+        &local_rss_mb,
+        &current_sample.rss_mb_sum,
+        1,
+        MPI_DOUBLE,
+        MPI_SUM,
+        communicator);
+    double local_max_values[2] = {local_rss_mb, node_rss_mb_sum};
+    double global_max_values[2] = {0.0, 0.0};
+    MPI_Allreduce(
+        local_max_values,
+        global_max_values,
+        2,
+        MPI_DOUBLE,
+        MPI_MAX,
+        communicator);
+    current_sample.rss_mb_max_rank = global_max_values[0];
+    current_sample.rss_mb_max_node = global_max_values[1];
 
-std::string first_present(const std::map<std::string, std::string>& row,
-                          const std::vector<std::string>& keys)
-{
-  for(const std::string& key : keys) {
-    const std::string value = field_or_empty(row, key);
-    if(!value.empty()) return value;
-  }
-  return "";
-}
-
-snapshot snapshot_from_named_row(const std::map<std::string, std::string>& row,
-                                 const std::string& base_directory)
-{
-  snapshot snap;
-  snap.solve_index = parse_int_or_default(field_or_empty(row, "solve_index"), 0);
-  snap.matrix_file_path = join_relative_to(
-      base_directory,
-      first_present(row, {"A", "matrix_file_path", "mat_file"}));
-  snap.right_hand_side_file_path = join_relative_to(
-      base_directory,
-      first_present(row, {"b", "right_hand_side_file_path", "rhs_file"}));
-  snap.initial_guess_file_path = join_relative_to(
-      base_directory,
-      first_present(row, {"x0", "initial_guess_file_path"}));
-  snap.metadata_file_path = join_relative_to(
-      base_directory,
-      first_present(row, {"meta", "metadata_file_path", "meta_file"}));
-  snap.rows = parse_petsc_int_or_default(field_or_empty(row, "rows"), 0);
-  snap.cols = parse_petsc_int_or_default(field_or_empty(row, "cols"), snap.rows);
-  snap.right_hand_side_size = parse_petsc_int_or_default(
-      first_present(row, {"rhs_size", "right_hand_side_size"}),
-      0);
-  snap.mpi_size = parse_int_or_default(field_or_empty(row, "mpi_size"), 1);
-  snap.symmetric = parse_bool(field_or_empty(row, "symmetric"));
-  snap.spd = parse_bool(field_or_empty(row, "spd"));
-  snap.matrix_nullspace_attached =
-      parse_bool(first_present(row, {"matrix_nullspace_attached", "nullspace"}));
-  snap.transpose_nullspace_attached = parse_bool(field_or_empty(row, "transpose_nullspace_attached"));
-  snap.near_nullspace_attached = parse_bool(field_or_empty(row, "near_nullspace_attached"));
-  snap.nullspace_kind = first_present(row, {"nullspace_kind"});
-  if(snap.nullspace_kind.empty()) snap.nullspace_kind = snap.matrix_nullspace_attached ? "unknown" : "none";
-  snap.nullspace_field_index = parse_int_or_default(field_or_empty(row, "nullspace_field_index"), -1);
-  snap.nullspace_block_size = parse_int_or_default(field_or_empty(row, "nullspace_block_size"), 0);
-  snap.rhs_nullspace_component_removed =
-      first_present(row, {"rhs_nullspace_component_removed"});
-  if(snap.rhs_nullspace_component_removed.empty()) snap.rhs_nullspace_component_removed = "unknown";
-  read_snapshot_metadata(snap);
-  snap.nullspace =
-      snap.matrix_nullspace_attached || snap.transpose_nullspace_attached || snap.near_nullspace_attached;
-  if(snap.nullspace_kind.empty() || (snap.nullspace && snap.nullspace_kind == "none")) {
-    snap.nullspace_kind = snap.nullspace ? "unknown" : "none";
-  }
-  return snap;
-}
-
-std::vector<snapshot> read_snapshot_collection(const std::string& path)
-{
-  std::ifstream input(path.c_str());
-  std::vector<snapshot> snapshots;
-  const std::string base_directory = dirname(path);
-  std::string line;
-
-  if(!std::getline(input, line)) return snapshots;
-  const std::vector<std::string> header = split_csv_line(line);
-  const bool has_header = std::find(header.begin(), header.end(), "solve_index") != header.end();
-  if(!has_header) return snapshots;
-
-  while(std::getline(input, line)) {
-    if(trim(line).empty()) continue;
-    const std::vector<std::string> fields = split_csv_line(line);
-    std::map<std::string, std::string> row;
-    for(size_t i = 0; i < header.size() && i < fields.size(); ++i) {
-      row[header[i]] = fields[i];
-    }
-    snapshots.push_back(snapshot_from_named_row(row, base_directory));
-  }
-
-  std::sort(snapshots.begin(), snapshots.end(), [](const snapshot& left, const snapshot& right) {
-    return left.solve_index < right.solve_index;
-  });
-  return snapshots;
-}
-
-bool ownership_ranges_match_current(const std::vector<PetscInt>& ranges)
-{
-  int communicator_size = 1;
-  MPI_Comm_size(PETSC_COMM_WORLD, &communicator_size);
-  return ranges.size() == static_cast<size_t>(communicator_size) + 1;
-}
-
-PetscInt local_size_from_ranges(const std::vector<PetscInt>& ranges)
-{
-  int rank = 0;
-  MPI_Comm_rank(PETSC_COMM_WORLD, &rank);
-  return ranges[static_cast<size_t>(rank) + 1] - ranges[static_cast<size_t>(rank)];
-}
-
-PetscErrorCode load_matrix_binary(const snapshot& snap, Mat* matrix)
-{
-  PetscViewer viewer = nullptr;
-  KSPTUNE_PETSC_CALL(PetscViewerBinaryOpen(
-      PETSC_COMM_WORLD,
-      snap.matrix_file_path.c_str(),
-      FILE_MODE_READ,
-      &viewer));
-  KSPTUNE_PETSC_CALL(MatCreate(PETSC_COMM_WORLD, matrix));
-  if(ownership_ranges_match_current(snap.row_ownership_ranges)) {
-    const PetscInt local_rows = local_size_from_ranges(snap.row_ownership_ranges);
-    KSPTUNE_PETSC_CALL(MatSetSizes(*matrix, local_rows, local_rows, snap.rows, snap.cols));
-    KSPTUNE_PETSC_CALL(MatSetType(*matrix, MATAIJ));
-  }
-  KSPTUNE_PETSC_CALL(MatLoad(*matrix, viewer));
-  KSPTUNE_PETSC_CALL(PetscViewerDestroy(&viewer));
-  return 0;
-}
-
-PetscErrorCode load_vector_binary(const std::string& path,
-                                  const std::vector<PetscInt>& ownership_ranges,
-                                  PetscInt global_size,
-                                  Vec* vector)
-{
-  PetscViewer viewer = nullptr;
-  KSPTUNE_PETSC_CALL(PetscViewerBinaryOpen(
-      PETSC_COMM_WORLD,
-      path.c_str(),
-      FILE_MODE_READ,
-      &viewer));
-  KSPTUNE_PETSC_CALL(VecCreate(PETSC_COMM_WORLD, vector));
-  if(ownership_ranges_match_current(ownership_ranges)) {
-    KSPTUNE_PETSC_CALL(VecSetSizes(*vector, local_size_from_ranges(ownership_ranges), global_size));
-    KSPTUNE_PETSC_CALL(VecSetType(*vector, VECMPI));
-  }
-  KSPTUNE_PETSC_CALL(VecLoad(*vector, viewer));
-  KSPTUNE_PETSC_CALL(PetscViewerDestroy(&viewer));
-  return 0;
-}
-
-std::string vector_cache_key(const std::string& path, PetscInt global_size)
-{
-  std::ostringstream key;
-  key << path << '\n' << "global_size=" << global_size;
-  return key.str();
-}
-
-double matrix_memory_mb(Mat matrix)
-{
-  MatInfo info;
-  if(MatGetInfo(matrix, MAT_GLOBAL_SUM, &info) != 0) return 0.0;
-  return double(info.memory) / (1024.0 * 1024.0);
-}
-
-double vector_memory_mb(Vec vector)
-{
-  PetscInt local_size = 0;
-  if(VecGetLocalSize(vector, &local_size) != 0) return 0.0;
-  double local_bytes = double(local_size) * double(sizeof(PetscScalar));
-  double global_bytes = 0.0;
-  MPI_Allreduce(&local_bytes, &global_bytes, 1, MPI_DOUBLE, MPI_SUM, PETSC_COMM_WORLD);
-  return global_bytes / (1024.0 * 1024.0);
-}
-
-PetscErrorCode load_vector_copy(const std::string& path,
-                                const std::vector<PetscInt>& ownership_ranges,
-                                PetscInt global_size,
-                                bool use_cache,
-                                std::map<std::string, vector_cache_context>& vector_cache,
-                                replay_cache_metadata& cache_metadata,
-                                Vec* vector)
-{
-  if(use_cache) {
-    const std::string key = vector_cache_key(path, global_size);
-    auto cached = vector_cache.find(key);
-    if(cached == vector_cache.end()) {
-      vector_cache_context context;
-      KSPTUNE_PETSC_CALL(load_vector_binary(path, ownership_ranges, global_size, &context.vector));
-      context.memory_mb = vector_memory_mb(context.vector);
-      cached = vector_cache.emplace(key, context).first;
-    }
-    cached->second.last_used = ++cache_metadata.clock;
-    KSPTUNE_PETSC_CALL(VecDuplicate(cached->second.vector, vector));
-    KSPTUNE_PETSC_CALL(VecCopy(cached->second.vector, *vector));
+    result.memory_samples.push_back(current_sample);
     return 0;
   }
 
-  KSPTUNE_PETSC_CALL(load_vector_binary(path, ownership_ranges, global_size, vector));
-  return 0;
+  PetscErrorCode destroy()
+  {
+    if(node_communicator != MPI_COMM_NULL) {
+      const int free_error = MPI_Comm_free(&node_communicator);
+      node_communicator = MPI_COMM_NULL;
+      if(free_error != MPI_SUCCESS) return PETSC_ERR_LIB;
+    }
+    return 0;
+  }
+};
+
+double nonnegative_memory_delta(double after, double before)
+{
+  return std::max(0.0, after - before);
+}
+
+void summarize_request_memory(replay_result& result)
+{
+  if(result.memory_samples.empty()) return;
+
+  const memory_sample* request_start = &result.memory_samples.front();
+  const memory_sample* request_end = &result.memory_samples.back();
+  std::map<std::string, double> before_setup_by_snapshot;
+  std::map<std::string, double> before_solve_by_snapshot;
+
+  for(const memory_sample& sample : result.memory_samples) {
+    if(sample.phase == "request_start") request_start = &sample;
+    if(sample.phase == "request_end") request_end = &sample;
+    result.rss_request_peak_sample_mb_sum =
+        std::max(result.rss_request_peak_sample_mb_sum, sample.rss_mb_sum);
+    result.rss_peak_sample_mb_max_rank = std::max(
+        result.rss_peak_sample_mb_max_rank,
+        sample.rss_mb_max_rank);
+    result.rss_peak_sample_mb_max_node = std::max(
+        result.rss_peak_sample_mb_max_node,
+        sample.rss_mb_max_node);
+
+    if(sample.solve_index < 0) continue;
+    if(sample.phase == "before_setup") {
+      before_setup_by_snapshot[sample.snapshot_id] = sample.rss_mb_sum;
+    } else if(sample.phase == "after_setup") {
+      const auto before = before_setup_by_snapshot.find(sample.snapshot_id);
+      if(before != before_setup_by_snapshot.end()) {
+        result.rss_setup_delta_mb_sum = std::max(
+            result.rss_setup_delta_mb_sum,
+            nonnegative_memory_delta(sample.rss_mb_sum, before->second));
+      }
+    } else if(sample.phase == "before_solve") {
+      before_solve_by_snapshot[sample.snapshot_id] = sample.rss_mb_sum;
+    } else if(sample.phase == "after_solve") {
+      const auto before = before_solve_by_snapshot.find(sample.snapshot_id);
+      if(before != before_solve_by_snapshot.end()) {
+        result.rss_solve_delta_mb_sum = std::max(
+            result.rss_solve_delta_mb_sum,
+            nonnegative_memory_delta(sample.rss_mb_sum, before->second));
+      }
+    }
+  }
+
+  result.rss_request_start_mb_sum = request_start->rss_mb_sum;
+  result.rss_request_end_mb_sum = request_end->rss_mb_sum;
+  result.rss_request_delta_mb_sum = nonnegative_memory_delta(
+      result.rss_request_end_mb_sum,
+      result.rss_request_start_mb_sum);
 }
 
 PetscErrorCode collect_matrix_diagnostics(Mat matrix,
@@ -874,6 +793,7 @@ PetscErrorCode collect_matrix_diagnostics(Mat matrix,
   diagnostics.nonzero_count = double(info.nz_used);
   diagnostics.allocated_nonzero_count = double(info.nz_allocated);
   diagnostics.petsc_matrix_memory_bytes = double(info.memory);
+  diagnostics.estimated_matrix_memory_bytes = matrix_memory_estimate_bytes(matrix);
 
   if(diagnose_matrix) {
     PetscBool symmetric = PETSC_FALSE;
@@ -884,56 +804,6 @@ PetscErrorCode collect_matrix_diagnostics(Mat matrix,
   return 0;
 }
 
-double local_peak_memory_mb()
-{
-  rusage usage;
-  if(getrusage(RUSAGE_SELF, &usage) != 0) return 0.0;
-  // Darwin reports ru_maxrss in bytes; Linux reports it in KiB.
-#if defined(__APPLE__) && defined(__MACH__)
-  return double(usage.ru_maxrss) / (1024.0 * 1024.0);
-#else
-  return double(usage.ru_maxrss) / 1024.0;
-#endif
-}
-
-void collect_memory_diagnostics(replay_result& result)
-{
-  const double local_peak_memory = local_peak_memory_mb();
-  MPI_Allreduce(
-      &local_peak_memory,
-      &result.peak_memory_mb_max_per_rank,
-      1,
-      MPI_DOUBLE,
-      MPI_MAX,
-      PETSC_COMM_WORLD);
-  MPI_Allreduce(
-      &local_peak_memory,
-      &result.peak_memory_mb_sum,
-      1,
-      MPI_DOUBLE,
-      MPI_SUM,
-      PETSC_COMM_WORLD);
-
-  int rank = 0;
-  int communicator_size = 1;
-  MPI_Comm_rank(PETSC_COMM_WORLD, &rank);
-  MPI_Comm_size(PETSC_COMM_WORLD, &communicator_size);
-  result.peak_memory_rank_count = communicator_size;
-  result.peak_memory_mb_mean_per_rank = communicator_size > 0
-      ? result.peak_memory_mb_sum / double(communicator_size)
-      : 0.0;
-  if(rank == 0) result.peak_memory_mb_per_rank.resize(size_t(communicator_size));
-  MPI_Gather(
-      &local_peak_memory,
-      1,
-      MPI_DOUBLE,
-      rank == 0 ? result.peak_memory_mb_per_rank.data() : nullptr,
-      1,
-      MPI_DOUBLE,
-      0,
-      PETSC_COMM_WORLD);
-}
-
 PetscErrorCode compute_residual_norm(Mat matrix,
                                      Vec right_hand_side,
                                      Vec solution,
@@ -941,10 +811,10 @@ PetscErrorCode compute_residual_norm(Mat matrix,
                                      double& rhs_norm,
                                      double& relative_residual)
 {
-  Vec matrix_times_solution = nullptr;
-  Vec residual_vector = nullptr;
-  KSPTUNE_PETSC_CALL(VecDuplicate(right_hand_side, &matrix_times_solution));
-  KSPTUNE_PETSC_CALL(VecDuplicate(right_hand_side, &residual_vector));
+  petsc_vector matrix_times_solution;
+  petsc_vector residual_vector;
+  KSPTUNE_PETSC_CALL(VecDuplicate(right_hand_side, matrix_times_solution.ptr()));
+  KSPTUNE_PETSC_CALL(VecDuplicate(right_hand_side, residual_vector.ptr()));
   KSPTUNE_PETSC_CALL(MatMult(matrix, solution, matrix_times_solution));
   KSPTUNE_PETSC_CALL(VecCopy(right_hand_side, residual_vector));
   KSPTUNE_PETSC_CALL(VecAXPY(residual_vector, -1.0, matrix_times_solution));
@@ -957,8 +827,8 @@ PetscErrorCode compute_residual_norm(Mat matrix,
   rhs_norm = double(rhs);
   relative_residual = rhs > 0.0 ? double(residual / rhs) : double(residual);
 
-  KSPTUNE_PETSC_CALL(VecDestroy(&residual_vector));
-  KSPTUNE_PETSC_CALL(VecDestroy(&matrix_times_solution));
+  KSPTUNE_PETSC_CALL(residual_vector.reset());
+  KSPTUNE_PETSC_CALL(matrix_times_solution.reset());
   return 0;
 }
 
@@ -976,8 +846,8 @@ PetscErrorCode create_field_nullspace(Vec reference_vector,
     return PETSC_ERR_ARG_OUTOFRANGE;
   }
 
-  Vec basis = nullptr;
-  KSPTUNE_PETSC_CALL(VecDuplicate(reference_vector, &basis));
+  petsc_vector basis;
+  KSPTUNE_PETSC_CALL(VecDuplicate(reference_vector, basis.ptr()));
 
   PetscInt ownership_start = 0;
   PetscInt ownership_end = 0;
@@ -998,13 +868,13 @@ PetscErrorCode create_field_nullspace(Vec reference_vector,
   PetscReal norm = 0.0;
   KSPTUNE_PETSC_CALL(VecNormalize(basis, &norm));
   if(norm == 0.0) {
-    VecDestroy(&basis);
+    basis.reset();
     PetscFPrintf(PETSC_COMM_WORLD, stderr, "Field nullspace basis is empty\n");
     return PETSC_ERR_ARG_WRONGSTATE;
   }
 
-  KSPTUNE_PETSC_CALL(MatNullSpaceCreate(PETSC_COMM_WORLD, PETSC_FALSE, 1, &basis, nullspace));
-  KSPTUNE_PETSC_CALL(VecDestroy(&basis));
+  KSPTUNE_PETSC_CALL(MatNullSpaceCreate(PETSC_COMM_WORLD, PETSC_FALSE, 1, basis.ptr(), nullspace));
+  KSPTUNE_PETSC_CALL(basis.reset());
   return 0;
 }
 
@@ -1045,13 +915,13 @@ PetscErrorCode apply_nullspace_actions(Mat matrix,
     ++aggregate.near_nullspace_attached_count;
   }
   if(actions.remove_rhs) {
-    Vec projected = nullptr;
-    Vec removed_component = nullptr;
-    KSPTUNE_PETSC_CALL(VecDuplicate(right_hand_side, &projected));
+    petsc_vector projected;
+    petsc_vector removed_component;
+    KSPTUNE_PETSC_CALL(VecDuplicate(right_hand_side, projected.ptr()));
     KSPTUNE_PETSC_CALL(VecCopy(right_hand_side, projected));
     KSPTUNE_PETSC_CALL(MatNullSpaceRemove(nullspace, projected));
 
-    KSPTUNE_PETSC_CALL(VecDuplicate(right_hand_side, &removed_component));
+    KSPTUNE_PETSC_CALL(VecDuplicate(right_hand_side, removed_component.ptr()));
     KSPTUNE_PETSC_CALL(VecCopy(right_hand_side, removed_component));
     KSPTUNE_PETSC_CALL(VecAXPY(removed_component, PetscScalar(-1.0), projected));
 
@@ -1069,8 +939,8 @@ PetscErrorCode apply_nullspace_actions(Mat matrix,
         aggregate.rhs_nullspace_removed_component_relative_norm_max,
         rhs_norm > 0.0 ? double(removed_norm / rhs_norm) : double(removed_norm));
 
-    KSPTUNE_PETSC_CALL(VecDestroy(&removed_component));
-    KSPTUNE_PETSC_CALL(VecDestroy(&projected));
+    KSPTUNE_PETSC_CALL(removed_component.reset());
+    KSPTUNE_PETSC_CALL(projected.reset());
   }
   return 0;
 }
@@ -1127,6 +997,18 @@ double population_stddev(const std::vector<double>& values)
   return std::sqrt(squared_delta_sum / double(values.size()));
 }
 
+double standard_error_of_mean(const std::vector<double>& values)
+{
+  if(values.size() < 2) return 0.0;
+  const double values_mean = mean(values);
+  double squared_delta_sum = 0.0;
+  for(double value : values) {
+    const double delta = value - values_mean;
+    squared_delta_sum += delta * delta;
+  }
+  return std::sqrt(squared_delta_sum / (double(values.size()) * double(values.size() - 1)));
+}
+
 double value_range(const std::vector<double>& values)
 {
   if(values.empty()) return 0.0;
@@ -1146,7 +1028,66 @@ double maximum_value(const std::vector<double>& values)
   return *std::max_element(values.begin(), values.end());
 }
 
-PetscErrorCode create_configured_ksp(const snapshot& snap, Mat matrix, KSP* ksp)
+struct scoped_petsc_option {
+  std::string key;
+  std::string previous_value;
+  bool previous_was_set = false;
+  bool active = false;
+
+  PetscErrorCode set(const char* option, const char* value)
+  {
+    key = option;
+    char buffer[4096] = "";
+    PetscBool was_set = PETSC_FALSE;
+    KSPTUNE_PETSC_CALL(PetscOptionsGetString(
+        nullptr,
+        nullptr,
+        key.c_str(),
+        buffer,
+        sizeof(buffer),
+        &was_set));
+    previous_was_set = was_set == PETSC_TRUE;
+    previous_value = previous_was_set ? buffer : "";
+    KSPTUNE_PETSC_CALL(PetscOptionsSetValue(nullptr, key.c_str(), value));
+    active = true;
+    return 0;
+  }
+
+  PetscErrorCode restore()
+  {
+    if(!active) return 0;
+    active = false;
+    if(previous_was_set) {
+      KSPTUNE_PETSC_CALL(PetscOptionsSetValue(
+          nullptr,
+          key.c_str(),
+          previous_value.c_str()));
+    } else {
+      KSPTUNE_PETSC_CALL(PetscOptionsClearValue(nullptr, key.c_str()));
+    }
+    return 0;
+  }
+
+  ~scoped_petsc_option()
+  {
+    if(active) {
+      (void)restore();
+    }
+  }
+};
+
+PetscErrorCode clear_hypre_errors()
+{
+#if KSPTUNE_HAS_HYPRE_UTILITIES
+  HYPRE_ClearAllErrors();
+#endif
+  return 0;
+}
+
+PetscErrorCode create_configured_ksp(const replay_args& args,
+                                     const snapshot& snap,
+                                     Mat matrix,
+                                     KSP* ksp)
 {
   KSPTUNE_PETSC_CALL(KSPCreate(PETSC_COMM_WORLD, ksp));
   KSPTUNE_PETSC_CALL(KSPSetOperators(*ksp, matrix, matrix));
@@ -1168,16 +1109,58 @@ PetscErrorCode create_configured_ksp(const snapshot& snap, Mat matrix, KSP* ksp)
         : PETSC_DEFAULT;
     KSPTUNE_PETSC_CALL(KSPSetTolerances(*ksp, rtol, atol, dtol, max_it));
   }
-  KSPTUNE_PETSC_CALL(KSPSetInitialGuessNonzero(*ksp, PETSC_TRUE));
+  KSPTUNE_PETSC_CALL(KSPSetInitialGuessNonzero(
+      *ksp,
+      args.use_initial_guess ? PETSC_TRUE : PETSC_FALSE));
   KSPTUNE_PETSC_CALL(KSPSetReusePreconditioner(*ksp, PETSC_TRUE));
-  KSPTUNE_PETSC_CALL(KSPSetFromOptions(*ksp));
+  scoped_petsc_option hypre_view_option;
+  if(args.hypre_hierarchy_diagnostics) {
+    KSPTUNE_PETSC_CALL(hypre_view_option.set(
+        "-pc_hypre_boomeramg_view_hierarchy",
+        "true"));
+  }
+  const PetscErrorCode set_from_options_ierr = KSPSetFromOptions(*ksp);
+  const PetscErrorCode restore_ierr = hypre_view_option.restore();
+  if(set_from_options_ierr || restore_ierr) {
+    (void)KSPDestroy(ksp);
+    if(set_from_options_ierr) return set_from_options_ierr;
+    return restore_ierr;
+  }
+  KSPTUNE_PETSC_CALL(KSPSetInitialGuessNonzero(
+      *ksp,
+      args.use_initial_guess ? PETSC_TRUE : PETSC_FALSE));
   return 0;
 }
 
-PetscErrorCode record_ksp_types(KSP ksp,
-                                replay_result& aggregate,
-                                std::string& ksp_type_text,
-                                std::string& pc_type_text)
+PetscErrorCode run_options_help()
+{
+  KSPTUNE_PETSC_CALL(PetscOptionsSetValue(nullptr, "-help", "true"));
+
+  petsc_matrix matrix;
+  petsc_ksp ksp;
+  KSPTUNE_PETSC_CALL(MatCreate(PETSC_COMM_WORLD, matrix.ptr()));
+  KSPTUNE_PETSC_CALL(MatSetSizes(matrix, PETSC_DECIDE, PETSC_DECIDE, 1, 1));
+  KSPTUNE_PETSC_CALL(MatSetFromOptions(matrix));
+  KSPTUNE_PETSC_CALL(MatSetUp(matrix));
+
+  PetscInt row_start = 0;
+  PetscInt row_end = 0;
+  KSPTUNE_PETSC_CALL(MatGetOwnershipRange(matrix, &row_start, &row_end));
+  if(row_start <= 0 && row_end > 0) {
+    KSPTUNE_PETSC_CALL(MatSetValue(matrix, 0, 0, PetscScalar(1.0), INSERT_VALUES));
+  }
+  KSPTUNE_PETSC_CALL(MatAssemblyBegin(matrix, MAT_FINAL_ASSEMBLY));
+  KSPTUNE_PETSC_CALL(MatAssemblyEnd(matrix, MAT_FINAL_ASSEMBLY));
+
+  KSPTUNE_PETSC_CALL(KSPCreate(PETSC_COMM_WORLD, ksp.ptr()));
+  KSPTUNE_PETSC_CALL(KSPSetOperators(ksp, matrix, matrix));
+  KSPTUNE_PETSC_CALL(KSPSetFromOptions(ksp));
+  KSPTUNE_PETSC_CALL(ksp.reset());
+  KSPTUNE_PETSC_CALL(matrix.reset());
+  return 0;
+}
+
+PetscErrorCode record_ksp_types(KSP ksp, replay_result& aggregate)
 {
   KSPType ksp_type = nullptr;
   PCType pc_type = nullptr;
@@ -1185,112 +1168,678 @@ PetscErrorCode record_ksp_types(KSP ksp,
   KSPTUNE_PETSC_CALL(KSPGetType(ksp, &ksp_type));
   KSPTUNE_PETSC_CALL(KSPGetPC(ksp, &pc));
   KSPTUNE_PETSC_CALL(PCGetType(pc, &pc_type));
-  ksp_type_text = ksp_type ? ksp_type : "";
-  pc_type_text = pc_type ? pc_type : "";
-  aggregate.ksp_type = ksp_type_text;
-  aggregate.pc_type = pc_type_text;
+  aggregate.ksp_type = ksp_type ? ksp_type : "";
+  aggregate.pc_type = pc_type ? pc_type : "";
+  return 0;
+}
+
+std::string ksp_norm_type_name(KSPNormType norm_type)
+{
+  switch(norm_type) {
+  case KSP_NORM_DEFAULT:
+    return "default";
+  case KSP_NORM_NONE:
+    return "none";
+  case KSP_NORM_PRECONDITIONED:
+    return "preconditioned";
+  case KSP_NORM_UNPRECONDITIONED:
+    return "unpreconditioned";
+  case KSP_NORM_NATURAL:
+    return "natural";
+  default:
+    return std::string("unknown(") + std::to_string(int(norm_type)) + ")";
+  }
+}
+
+PetscErrorCode record_ksp_residual_norm_type(KSP ksp, replay_result& aggregate)
+{
+  KSPNormType norm_type = KSP_NORM_DEFAULT;
+  KSPTUNE_PETSC_CALL(KSPGetNormType(ksp, &norm_type));
+  aggregate.ksp_residual_norm_type = ksp_norm_type_name(norm_type);
+  return 0;
+}
+
+PetscErrorCode record_ksp_tolerances(KSP ksp, replay_result& aggregate)
+{
+  PetscReal rtol = 0.0;
+  PetscReal atol = 0.0;
+  PetscReal dtol = 0.0;
+  PetscInt max_it = 0;
+  KSPTUNE_PETSC_CALL(KSPGetTolerances(ksp, &rtol, &atol, &dtol, &max_it));
+  aggregate.ksp_rtol = double(rtol);
+  aggregate.ksp_atol = double(atol);
+  aggregate.ksp_dtol = double(dtol);
+  aggregate.ksp_max_it = int(max_it);
+  return 0;
+}
+
+double ratio_or_zero(double numerator, double denominator)
+{
+  return denominator > 0.0 ? numerator / denominator : 0.0;
+}
+
+void set_metric(std::map<std::string, double>& metrics,
+                const std::string& name,
+                double value)
+{
+  metrics[name] = value;
+}
+
+void update_max_metric(std::map<std::string, double>& metrics,
+                       const std::string& name,
+                       double value)
+{
+  const auto entry = metrics.find(name);
+  if(entry == metrics.end() || value > entry->second) metrics[name] = value;
+}
+
+void update_min_positive_metric(std::map<std::string, double>& metrics,
+                                const std::string& name,
+                                double value)
+{
+  if(value <= 0.0) return;
+  const auto entry = metrics.find(name);
+  if(entry == metrics.end() || entry->second <= 0.0 || value < entry->second) {
+    metrics[name] = value;
+  }
+}
+
+double metric_or_zero(const std::map<std::string, double>& metrics,
+                      const std::string& name)
+{
+  const auto entry = metrics.find(name);
+  return entry == metrics.end() ? 0.0 : entry->second;
+}
+
+bool replay_result_has_pc_diagnostic_key(const replay_result& result,
+                                         const std::string& key)
+{
+  return std::find(
+      result.recorded_pc_diagnostic_keys.begin(),
+      result.recorded_pc_diagnostic_keys.end(),
+      key) != result.recorded_pc_diagnostic_keys.end();
+}
+
+PetscErrorCode collect_gamg_diagnostics(PC pc, pc_diagnostic_record& record)
+{
+  PetscInt levels = 0;
+  KSPTUNE_PETSC_CALL(PCMGGetLevels(pc, &levels));
+  if(levels <= 0) return 0;
+
+  PetscReal grid_complexity = 0.0;
+  PetscReal operator_complexity = 0.0;
+  KSPTUNE_PETSC_CALL(PCMGGetGridComplexity(pc, &grid_complexity, &operator_complexity));
+
+  double total_rows = 0.0;
+  double total_nonzeros = 0.0;
+  double finest_rows = 0.0;
+  double finest_nonzeros = 0.0;
+  double coarsest_rows = 0.0;
+  double coarsest_nonzeros = 0.0;
+  double interpolation_nonzeros = 0.0;
+
+  for(PetscInt level = 0; level < levels; ++level) {
+    pc_diagnostic_level hierarchy_level;
+    hierarchy_level.level = int(level);
+    hierarchy_level.level_from_finest = int(levels - 1 - level);
+
+    KSP smoother = nullptr;
+    KSPTUNE_PETSC_CALL(PCMGGetSmoother(pc, level, &smoother));
+    if(smoother) {
+      Mat level_matrix = nullptr;
+      KSPTUNE_PETSC_CALL(KSPGetOperators(smoother, nullptr, &level_matrix));
+      if(level_matrix) {
+        PetscInt rows = 0;
+        PetscInt row_start = 0;
+        PetscInt row_end = 0;
+        MatInfo info;
+        KSPTUNE_PETSC_CALL(MatGetSize(level_matrix, &rows, nullptr));
+        KSPTUNE_PETSC_CALL(MatGetOwnershipRange(level_matrix, &row_start, &row_end));
+        KSPTUNE_PETSC_CALL(MatGetInfo(level_matrix, MAT_GLOBAL_SUM, &info));
+        double active_ranks = row_end > row_start ? 1.0 : 0.0;
+        MPI_Allreduce(MPI_IN_PLACE, &active_ranks, 1, MPI_DOUBLE, MPI_SUM, PETSC_COMM_WORLD);
+
+        set_metric(hierarchy_level.metrics, "rows", double(rows));
+        set_metric(hierarchy_level.metrics, "nonzeros", double(info.nz_used));
+        set_metric(
+            hierarchy_level.metrics,
+            "avg_nonzeros_per_row",
+            ratio_or_zero(info.nz_used, double(rows)));
+        set_metric(hierarchy_level.metrics, "active_ranks", active_ranks);
+        update_max_metric(
+            record.metrics,
+            "max_operator_nonzeros_per_row",
+            metric_or_zero(hierarchy_level.metrics, "avg_nonzeros_per_row"));
+        update_min_positive_metric(record.metrics, "min_active_ranks", active_ranks);
+
+        total_rows += double(rows);
+        total_nonzeros += double(info.nz_used);
+        if(level == 0) {
+          coarsest_rows = double(rows);
+          coarsest_nonzeros = double(info.nz_used);
+        }
+        if(level == levels - 1) {
+          finest_rows = double(rows);
+          finest_nonzeros = double(info.nz_used);
+        }
+      }
+    }
+    if(level > 0) {
+      Mat interpolation = nullptr;
+      KSPTUNE_PETSC_CALL(PCMGGetInterpolation(pc, level, &interpolation));
+      if(interpolation) {
+        PetscInt interpolation_rows = 0;
+        MatInfo info;
+        KSPTUNE_PETSC_CALL(MatGetSize(interpolation, &interpolation_rows, nullptr));
+        KSPTUNE_PETSC_CALL(MatGetInfo(interpolation, MAT_GLOBAL_SUM, &info));
+        set_metric(
+            hierarchy_level.metrics,
+            "interpolation_nonzeros",
+            double(info.nz_used));
+        set_metric(
+            hierarchy_level.metrics,
+            "interpolation_avg_nonzeros_per_row",
+            ratio_or_zero(info.nz_used, double(interpolation_rows)));
+        update_max_metric(
+            record.metrics,
+            "max_interpolation_nonzeros_per_row",
+            metric_or_zero(
+                hierarchy_level.metrics,
+                "interpolation_avg_nonzeros_per_row"));
+        interpolation_nonzeros += double(info.nz_used);
+      }
+    }
+    record.levels.push_back(hierarchy_level);
+  }
+
+  set_metric(record.metrics, "levels", double(levels));
+  set_metric(record.metrics, "grid_complexity", double(grid_complexity));
+  set_metric(record.metrics, "operator_complexity", double(operator_complexity));
+  set_metric(record.metrics, "finest_rows", finest_rows);
+  set_metric(record.metrics, "finest_nonzeros", finest_nonzeros);
+  set_metric(record.metrics, "coarsest_rows", coarsest_rows);
+  set_metric(record.metrics, "coarsest_nonzeros", coarsest_nonzeros);
+  set_metric(record.metrics, "total_rows", total_rows);
+  set_metric(record.metrics, "total_nonzeros", total_nonzeros);
+  set_metric(record.metrics, "interpolation_nonzeros", interpolation_nonzeros);
+  return 0;
+}
+
+struct hypre_diagnostics {
+  std::map<std::string, double> metrics;
+  std::vector<pc_diagnostic_level> levels;
+};
+
+bool line_starts_with(const std::string& line, const std::string& prefix)
+{
+  return line.size() >= prefix.size() &&
+      line.compare(0, prefix.size(), prefix) == 0;
+}
+
+bool parse_labeled_double(const std::string& line,
+                          const std::string& label,
+                          double& value)
+{
+  if(!line_starts_with(line, label)) return false;
+  std::stringstream stream(line.substr(label.size()));
+  return bool(stream >> value);
+}
+
+hypre_diagnostics parse_hypre_view_text(const std::string& text)
+{
+  hypre_diagnostics diagnostics;
+  std::stringstream input(text);
+  std::string line;
+  bool in_hierarchy = false;
+  int finest_level = -1;
+  int coarsest_level = -1;
+  std::map<int, pc_diagnostic_level> hierarchy_by_level;
+
+  while(std::getline(input, line)) {
+    line = trim(line);
+    if(line.find("BoomerAMG hierarchy statistics") != std::string::npos) {
+      in_hierarchy = true;
+      continue;
+    }
+    if(!in_hierarchy || line.empty()) continue;
+
+    double value = 0.0;
+    if(parse_labeled_double(line, "grid complexity", value)) {
+      set_metric(diagnostics.metrics, "grid_complexity", value);
+      continue;
+    }
+    if(parse_labeled_double(line, "operator complexity", value)) {
+      set_metric(diagnostics.metrics, "operator_complexity", value);
+      continue;
+    }
+    if(parse_labeled_double(line, "interpolation complexity", value)) {
+      set_metric(diagnostics.metrics, "interpolation_complexity", value);
+      continue;
+    }
+
+    std::stringstream stream(line);
+    std::string op;
+    int level = -1;
+    double rows = 0.0;
+    double nonzeros = 0.0;
+    double nonzeros_per_row = 0.0;
+    double max_row_nonzeros = 0.0;
+    double offdiag_nonzeros = 0.0;
+    if(!(stream >> op >> level >> rows >> nonzeros >> nonzeros_per_row >>
+         max_row_nonzeros >> offdiag_nonzeros)) {
+      continue;
+    }
+    if(op != "A" && op != "P") continue;
+
+    update_max_metric(diagnostics.metrics, "max_row_nonzeros", max_row_nonzeros);
+    diagnostics.metrics["offdiag_nonzeros"] += offdiag_nonzeros;
+
+    pc_diagnostic_level& hierarchy_level = hierarchy_by_level[level];
+    hierarchy_level.level = level;
+    hierarchy_level.level_from_finest = level;
+
+    if(op == "A") {
+      set_metric(hierarchy_level.metrics, "rows", rows);
+      set_metric(hierarchy_level.metrics, "nonzeros", nonzeros);
+      set_metric(hierarchy_level.metrics, "avg_nonzeros_per_row", nonzeros_per_row);
+      set_metric(hierarchy_level.metrics, "max_row_nonzeros", max_row_nonzeros);
+      set_metric(hierarchy_level.metrics, "offdiag_nonzeros", offdiag_nonzeros);
+      update_max_metric(
+          diagnostics.metrics,
+          "max_operator_nonzeros_per_row",
+          nonzeros_per_row);
+      diagnostics.metrics["total_rows"] += rows;
+      diagnostics.metrics["total_nonzeros"] += nonzeros;
+      if(finest_level < 0 || level < finest_level) {
+        finest_level = level;
+        set_metric(diagnostics.metrics, "finest_rows", rows);
+        set_metric(diagnostics.metrics, "finest_nonzeros", nonzeros);
+      }
+      if(level > coarsest_level) {
+        coarsest_level = level;
+        set_metric(diagnostics.metrics, "coarsest_rows", rows);
+        set_metric(diagnostics.metrics, "coarsest_nonzeros", nonzeros);
+      }
+    } else {
+      set_metric(hierarchy_level.metrics, "interpolation_nonzeros", nonzeros);
+      set_metric(
+          hierarchy_level.metrics,
+          "interpolation_avg_nonzeros_per_row",
+          nonzeros_per_row);
+      update_max_metric(
+          diagnostics.metrics,
+          "max_interpolation_nonzeros_per_row",
+          nonzeros_per_row);
+      diagnostics.metrics["interpolation_nonzeros"] += nonzeros;
+    }
+  }
+
+  if(coarsest_level < 0) return diagnostics;
+  set_metric(diagnostics.metrics, "levels", double(coarsest_level + 1));
+  if(metric_or_zero(diagnostics.metrics, "grid_complexity") <= 0.0 &&
+     metric_or_zero(diagnostics.metrics, "finest_rows") > 0.0) {
+    set_metric(
+        diagnostics.metrics,
+        "grid_complexity",
+        metric_or_zero(diagnostics.metrics, "total_rows") /
+            metric_or_zero(diagnostics.metrics, "finest_rows"));
+  }
+  if(metric_or_zero(diagnostics.metrics, "operator_complexity") <= 0.0 &&
+     metric_or_zero(diagnostics.metrics, "finest_nonzeros") > 0.0) {
+    set_metric(
+        diagnostics.metrics,
+        "operator_complexity",
+        metric_or_zero(diagnostics.metrics, "total_nonzeros") /
+            metric_or_zero(diagnostics.metrics, "finest_nonzeros"));
+  }
+  if(metric_or_zero(diagnostics.metrics, "interpolation_complexity") <= 0.0 &&
+     metric_or_zero(diagnostics.metrics, "finest_nonzeros") > 0.0) {
+    set_metric(
+        diagnostics.metrics,
+        "interpolation_complexity",
+        metric_or_zero(diagnostics.metrics, "interpolation_nonzeros") /
+            metric_or_zero(diagnostics.metrics, "finest_nonzeros"));
+  }
+  for(auto& entry : hierarchy_by_level) {
+    diagnostics.levels.push_back(entry.second);
+  }
+  return diagnostics;
+}
+
+std::string hypre_view_temporary_path(const std::string& json_output_path)
+{
+  if(json_output_path.empty()) return "";
+  return json_output_path + ".hypre_view.tmp";
+}
+
+PetscErrorCode capture_pc_view_text(PC pc,
+                                    const std::string& path,
+                                    std::string& text)
+{
+  text.clear();
+  if(path.empty()) return 0;
+
+  PetscViewer viewer = nullptr;
+  PetscErrorCode ierr = PetscViewerASCIIOpen(PETSC_COMM_WORLD, path.c_str(), &viewer);
+  if(!ierr) {
+    ierr = PCView(pc, viewer);
+  }
+  if(viewer) {
+    const PetscErrorCode destroy_ierr = PetscViewerDestroy(&viewer);
+    if(!ierr) ierr = destroy_ierr;
+  }
+  if(ierr) return 0;
+
+  if(MPI_Barrier(PETSC_COMM_WORLD) != MPI_SUCCESS) return PETSC_ERR_LIB;
+  int rank = 0;
+  MPI_Comm_rank(PETSC_COMM_WORLD, &rank);
+  if(rank == 0) {
+    std::ifstream input(path.c_str());
+    std::stringstream buffer;
+    buffer << input.rdbuf();
+    text = buffer.str();
+    std::remove(path.c_str());
+  }
+  return 0;
+}
+
+PetscErrorCode collect_hypre_diagnostics(PC pc,
+                                         const std::string& json_output_path,
+                                         pc_diagnostic_record& record)
+{
+  std::string view_text;
+  KSPTUNE_PETSC_CALL(capture_pc_view_text(
+      pc,
+      hypre_view_temporary_path(json_output_path),
+      view_text));
+  int rank = 0;
+  MPI_Comm_rank(PETSC_COMM_WORLD, &rank);
+  if(rank == 0 && !view_text.empty()) {
+    const hypre_diagnostics diagnostics = parse_hypre_view_text(view_text);
+    record.metrics = diagnostics.metrics;
+    record.levels = diagnostics.levels;
+  }
+  return 0;
+}
+
+std::string asm_type_name(PCASMType type)
+{
+  switch(type) {
+  case PC_ASM_BASIC:
+    return "basic";
+  case PC_ASM_RESTRICT:
+    return "restrict";
+  case PC_ASM_INTERPOLATE:
+    return "interpolate";
+  case PC_ASM_NONE:
+    return "none";
+  default:
+    return "unknown";
+  }
+}
+
+PetscErrorCode record_first_subksp_types(KSP* subksps,
+                                         PetscInt local_count,
+                                         pc_diagnostic_record& record)
+{
+  if(local_count <= 0 || !subksps || !subksps[0]) return 0;
+  KSPType sub_ksp_type = nullptr;
+  KSPTUNE_PETSC_CALL(KSPGetType(subksps[0], &sub_ksp_type));
+  if(sub_ksp_type) record.string_metrics["sub_ksp_type"] = sub_ksp_type;
+  PC sub_pc = nullptr;
+  KSPTUNE_PETSC_CALL(KSPGetPC(subksps[0], &sub_pc));
+  if(sub_pc) {
+    PCType sub_pc_type = nullptr;
+    KSPTUNE_PETSC_CALL(PCGetType(sub_pc, &sub_pc_type));
+    if(sub_pc_type) record.string_metrics["sub_pc_type"] = sub_pc_type;
+  }
+  return 0;
+}
+
+PetscErrorCode collect_bjacobi_diagnostics(PC pc, pc_diagnostic_record& record)
+{
+  PetscInt local_blocks = 0;
+  PetscInt first_local_block = 0;
+  KSP* subksps = nullptr;
+  KSPTUNE_PETSC_CALL(
+      PCBJacobiGetSubKSP(pc, &local_blocks, &first_local_block, &subksps));
+  PetscInt global_blocks = local_blocks;
+  MPI_Allreduce(MPI_IN_PLACE, &global_blocks, 1, MPIU_INT, MPI_SUM, PETSC_COMM_WORLD);
+  set_metric(record.metrics, "local_blocks", double(local_blocks));
+  set_metric(record.metrics, "global_blocks", double(global_blocks));
+  set_metric(record.metrics, "first_local_block", double(first_local_block));
+  KSPTUNE_PETSC_CALL(record_first_subksp_types(subksps, local_blocks, record));
+  return 0;
+}
+
+PetscErrorCode collect_asm_diagnostics(PC pc, pc_diagnostic_record& record)
+{
+  PCASMType asm_type;
+  KSPTUNE_PETSC_CALL(PCASMGetType(pc, &asm_type));
+  record.string_metrics["asm_type"] = asm_type_name(asm_type);
+
+  PetscInt local_subdomains = 0;
+  PetscInt first_local_subdomain = 0;
+  KSP* subksps = nullptr;
+  KSPTUNE_PETSC_CALL(
+      PCASMGetSubKSP(pc, &local_subdomains, &first_local_subdomain, &subksps));
+  PetscInt global_subdomains = local_subdomains;
+  MPI_Allreduce(
+      MPI_IN_PLACE,
+      &global_subdomains,
+      1,
+      MPIU_INT,
+      MPI_SUM,
+      PETSC_COMM_WORLD);
+  set_metric(record.metrics, "local_subdomains", double(local_subdomains));
+  set_metric(record.metrics, "global_subdomains", double(global_subdomains));
+  set_metric(record.metrics, "first_local_subdomain", double(first_local_subdomain));
+  KSPTUNE_PETSC_CALL(record_first_subksp_types(subksps, local_subdomains, record));
+  return 0;
+}
+
+PetscErrorCode record_pc_diagnostics_once(KSP ksp,
+                                          const std::string& diagnostic_key,
+                                          const std::string& json_output_path,
+                                          replay_result& result)
+{
+  if(replay_result_has_pc_diagnostic_key(result, diagnostic_key)) return 0;
+
+  PC pc = nullptr;
+  PCType pc_type = nullptr;
+  KSPTUNE_PETSC_CALL(KSPGetPC(ksp, &pc));
+  KSPTUNE_PETSC_CALL(PCGetType(pc, &pc_type));
+  if(!pc_type) return 0;
+
+  pc_diagnostic_record record;
+  record.pc_type = pc_type;
+  record.setup_key = diagnostic_key;
+  record.setup_index = int(result.pc_diagnostics.size()) + 1;
+  result.recorded_pc_diagnostic_keys.push_back(diagnostic_key);
+
+  const std::string pc_type_text(pc_type);
+  if(pc_type_text == "gamg") {
+    KSPTUNE_PETSC_CALL(collect_gamg_diagnostics(pc, record));
+  } else if(pc_type_text == "hypre") {
+    KSPTUNE_PETSC_CALL(collect_hypre_diagnostics(pc, json_output_path, record));
+  } else if(pc_type_text == "bjacobi") {
+    KSPTUNE_PETSC_CALL(collect_bjacobi_diagnostics(pc, record));
+  } else if(pc_type_text == "asm") {
+    KSPTUNE_PETSC_CALL(collect_asm_diagnostics(pc, record));
+  }
+  result.pc_diagnostics.push_back(record);
+  return 0;
+}
+
+struct ksp_rtol_reference {
+  double norm = 0.0;
+  double threshold_norm = 0.0;
+  double relative_final_norm = 0.0;
+  std::string source = "residual-history";
+};
+
+ksp_rtol_reference get_ksp_rtol_reference(KSP ksp,
+                                          double fallback_reference_norm,
+                                          double final_ksp_residual_norm,
+                                          double rtol,
+                                          double atol)
+{
+  ksp_rtol_reference reference;
+  reference.norm = fallback_reference_norm;
+  reference.threshold_norm = std::max(rtol * fallback_reference_norm, atol);
+
+  // PETSc does not expose the default convergence test's rnorm0/ttol via public KSP API.
+#if KSPTUNE_HAS_PETSC_PRIVATE_KSPIMPL
+  if(ksp) {
+    reference.norm = double(ksp->rnorm0);
+    reference.threshold_norm = double(ksp->ttol);
+    reference.source = "petsc-rnorm0";
+  }
+#else
+  (void)ksp;
+#endif
+
+  if(reference.norm > 0.0) {
+    reference.relative_final_norm = final_ksp_residual_norm / reference.norm;
+  }
+  return reference;
+}
+
+PetscErrorCode prepare_ksp_residual_history(KSP ksp,
+                                            std::vector<PetscReal>& residual_history)
+{
+  PetscInt max_iterations = 10000;
+  KSPTUNE_PETSC_CALL(KSPGetTolerances(ksp, nullptr, nullptr, nullptr, &max_iterations));
+  if(max_iterations <= 0) max_iterations = 10000;
+  const PetscInt history_size = std::min<PetscInt>(
+      std::max<PetscInt>(max_iterations + 2, 2),
+      100000);
+  residual_history.assign(static_cast<size_t>(history_size), PetscReal(0.0));
+  KSPTUNE_PETSC_CALL(KSPSetResidualHistory(
+      ksp,
+      residual_history.data(),
+      history_size,
+      PETSC_TRUE));
+  return 0;
+}
+
+struct soft_timeout_convergence_context {
+  PetscErrorCode (*original_converged)(KSP, PetscInt, PetscReal, KSPConvergedReason*, void*) =
+      nullptr;
+  void* original_context = nullptr;
+  PetscErrorCode (*original_destroy)(void*) = nullptr;
+  double soft_timeout_sec = -1.0;
+  double solve_elapsed_before_sec = 0.0;
+  double solve_start_time_sec = 0.0;
+  bool* soft_timeout_triggered = nullptr;
+  double* soft_timeout_elapsed_sec = nullptr;
+};
+
+PetscErrorCode soft_timeout_converged(KSP ksp,
+                                      PetscInt iteration,
+                                      PetscReal residual_norm,
+                                      KSPConvergedReason* reason,
+                                      void* context)
+{
+  auto* timeout_context = static_cast<soft_timeout_convergence_context*>(context);
+  if(timeout_context && timeout_context->original_converged) {
+    KSPTUNE_PETSC_CALL(timeout_context->original_converged(
+        ksp,
+        iteration,
+        residual_norm,
+        reason,
+        timeout_context->original_context));
+  }
+  if(!timeout_context || timeout_context->soft_timeout_sec < 0.0) return 0;
+  if(*reason != KSP_CONVERGED_ITERATING) return 0;
+
+  PetscLogDouble now = 0.0;
+  KSPTUNE_PETSC_CALL(PetscTime(&now));
+  const double elapsed = timeout_context->solve_elapsed_before_sec +
+      double(now - timeout_context->solve_start_time_sec);
+  if(elapsed >= timeout_context->soft_timeout_sec) {
+    *reason = KSP_DIVERGED_ITS;
+    if(timeout_context->soft_timeout_triggered) {
+      *timeout_context->soft_timeout_triggered = true;
+    }
+    if(timeout_context->soft_timeout_elapsed_sec) {
+      *timeout_context->soft_timeout_elapsed_sec = elapsed;
+    }
+  }
   return 0;
 }
 
 PetscErrorCode replay_snapshot(const replay_args& args,
                                const snapshot& snap,
                                const replay_snapshot_plan& plan,
-                               std::map<std::string, Mat>& matrix_cache,
-                               std::map<std::string, vector_cache_context>& vector_cache,
-                               replay_cache_metadata& cache_metadata,
-                               std::map<std::string, ksp_setup_context>& ksp_context_cache,
+                               replay_cache& cache,
                                PetscLogStage solve_log_stage,
                                bool solve_mpi_logging_enabled,
+                               const memory_tracker& memory,
                                replay_result& aggregate,
                                std::vector<double>& solve_times,
                                std::vector<double>& iteration_counts)
 {
+  petsc_matrix local_matrix;
+  petsc_vector right_hand_side, initial_guess, solution;
+  ksp_setup_context local_context;
   Mat matrix = nullptr;
-  Vec right_hand_side = nullptr;
-  Vec initial_guess = nullptr;
-  Vec solution = nullptr;
-  KSP ksp = nullptr;
-  ksp_setup_context* ksp_context = nullptr;
 
   PetscLogDouble load_start = 0.0;
   PetscLogDouble load_end = 0.0;
+  PetscLogDouble matrix_prepare_start = 0.0;
+  PetscLogDouble matrix_prepare_end = 0.0;
+  PetscLogDouble vector_prepare_start = 0.0;
+  PetscLogDouble vector_prepare_end = 0.0;
   KSPTUNE_PETSC_CALL(PetscTime(&load_start));
+  KSPTUNE_PETSC_CALL(PetscTime(&matrix_prepare_start));
   const bool cache_ksp_setup =
       args.reuse_ksp_setup && (args.replay_server || plan.ksp_setup_cache_key_count > 1);
-  bool ksp_context_hit = false;
-  bool ksp_owned_by_cache = false;
-  const bool cache_matrix = args.replay_server || plan.matrix_cache_key_count > 1;
-  bool matrix_owned_by_cache = false;
-  if(cache_ksp_setup) {
-    auto cached_context = ksp_context_cache.find(plan.ksp_setup_cache_key);
-    if(cached_context != ksp_context_cache.end()) {
-      ksp_context = &cached_context->second;
-      matrix = ksp_context->matrix;
-      ksp = ksp_context->ksp;
-      matrix_owned_by_cache = true;
-      ksp_owned_by_cache = true;
-      ksp_context_hit = true;
-      ksp_context->last_used = ++cache_metadata.clock;
-      cache_metadata.matrix_last_used[plan.matrix_cache_key] = cache_metadata.clock;
-      ++aggregate.matrix_cache_hits;
-      ++aggregate.ksp_setup_cache_hits;
-    } else {
-      auto cached_matrix = matrix_cache.find(plan.matrix_cache_key);
-      if(cached_matrix != matrix_cache.end()) {
-        matrix = cached_matrix->second;
-        cache_metadata.matrix_last_used[plan.matrix_cache_key] = ++cache_metadata.clock;
-        ++aggregate.matrix_cache_hits;
-      } else {
-        KSPTUNE_PETSC_CALL(load_matrix_binary(snap, &matrix));
-        matrix_cache[plan.matrix_cache_key] = matrix;
-        cache_metadata.matrix_memory_mb[plan.matrix_cache_key] = matrix_memory_mb(matrix);
-        cache_metadata.matrix_last_used[plan.matrix_cache_key] = ++cache_metadata.clock;
-        ++aggregate.matrix_cache_misses;
-      }
-      ksp_context = &ksp_context_cache[plan.ksp_setup_cache_key];
-      ksp_context->matrix = matrix;
-      matrix_owned_by_cache = true;
-    }
-  } else if(cache_matrix) {
-    auto cached_matrix = matrix_cache.find(plan.matrix_cache_key);
-    if(cached_matrix != matrix_cache.end()) {
-      matrix = cached_matrix->second;
-      matrix_owned_by_cache = true;
-      cache_metadata.matrix_last_used[plan.matrix_cache_key] = ++cache_metadata.clock;
-      ++aggregate.matrix_cache_hits;
-    } else {
-      KSPTUNE_PETSC_CALL(load_matrix_binary(snap, &matrix));
-      matrix_cache[plan.matrix_cache_key] = matrix;
-      matrix_owned_by_cache = true;
-      cache_metadata.matrix_memory_mb[plan.matrix_cache_key] = matrix_memory_mb(matrix);
-      cache_metadata.matrix_last_used[plan.matrix_cache_key] = ++cache_metadata.clock;
-      ++aggregate.matrix_cache_misses;
-    }
+  auto& context = cache_ksp_setup ? cache.ksps[plan.ksp_setup_cache_key] : local_context;
+  const bool ksp_context_hit = context.ksp.value != nullptr;
+  context.matrix_cache_key = plan.matrix_cache_key;
+  if(ksp_context_hit) ++aggregate.ksp_setup_cache_hits;
+  bool matrix_hit = false;
+  if(args.replay_server || plan.matrix_cache_key_count > 1) {
+    KSPTUNE_PETSC_CALL(cache.load_matrix(snap, plan.matrix_cache_key, matrix, matrix_hit));
   } else {
-    KSPTUNE_PETSC_CALL(load_matrix_binary(snap, &matrix));
-    ++aggregate.matrix_cache_misses;
+    KSPTUNE_PETSC_CALL(load_matrix_binary(snap, local_matrix.ptr()));
+    matrix = local_matrix;
   }
-  KSPTUNE_PETSC_CALL(load_vector_copy(
+  if(matrix_hit) ++aggregate.matrix_cache_hits;
+  else ++aggregate.matrix_cache_misses;
+  KSPTUNE_PETSC_CALL(PetscTime(&matrix_prepare_end));
+  double matrix_prepare_elapsed = double(matrix_prepare_end - matrix_prepare_start);
+  MPI_Allreduce(MPI_IN_PLACE, &matrix_prepare_elapsed, 1, MPI_DOUBLE, MPI_MAX, PETSC_COMM_WORLD);
+  aggregate.matrix_prepare_time_sec += matrix_prepare_elapsed;
+  KSPTUNE_PETSC_CALL(memory.sample(aggregate, "after_matrix", snap.solve_index, snap.snapshot_id));
+  KSPTUNE_PETSC_CALL(PetscTime(&vector_prepare_start));
+  KSPTUNE_PETSC_CALL(cache.load_vector_copy(
       snap.right_hand_side_file_path,
       snap.rhs_ownership_ranges,
       snap.right_hand_side_size,
       args.replay_server,
-      vector_cache,
-      cache_metadata,
-      &right_hand_side));
+      right_hand_side.ptr()));
   const std::string initial_guess_path = args.initial_guess_vector_path.empty()
       ? snap.initial_guess_file_path
       : args.initial_guess_vector_path;
-  KSPTUNE_PETSC_CALL(load_vector_copy(
+  KSPTUNE_PETSC_CALL(cache.load_vector_copy(
       initial_guess_path,
       snap.x0_ownership_ranges,
       snap.right_hand_side_size,
       args.replay_server,
-      vector_cache,
-      cache_metadata,
-      &initial_guess));
-  KSPTUNE_PETSC_CALL(VecDuplicate(initial_guess, &solution));
-  KSPTUNE_PETSC_CALL(VecCopy(initial_guess, solution));
+      initial_guess.ptr()));
+  KSPTUNE_PETSC_CALL(VecDuplicate(initial_guess, solution.ptr()));
+  if(args.use_initial_guess) {
+    KSPTUNE_PETSC_CALL(VecCopy(initial_guess, solution));
+  } else {
+    KSPTUNE_PETSC_CALL(VecSet(solution, 0.0));
+  }
+  KSPTUNE_PETSC_CALL(PetscTime(&vector_prepare_end));
+  double vector_prepare_elapsed = double(vector_prepare_end - vector_prepare_start);
+  MPI_Allreduce(MPI_IN_PLACE, &vector_prepare_elapsed, 1, MPI_DOUBLE, MPI_MAX, PETSC_COMM_WORLD);
+  aggregate.vector_prepare_time_sec += vector_prepare_elapsed;
+  KSPTUNE_PETSC_CALL(memory.sample(aggregate, "after_vectors", snap.solve_index, snap.snapshot_id));
   KSPTUNE_PETSC_CALL(PetscTime(&load_end));
   double load_elapsed = double(load_end - load_start);
   MPI_Allreduce(MPI_IN_PLACE, &load_elapsed, 1, MPI_DOUBLE, MPI_MAX, PETSC_COMM_WORLD);
@@ -1304,6 +1853,9 @@ PetscErrorCode replay_snapshot(const replay_args& args,
     aggregate.nullspace_source = plan.nullspace_choice.source;
   }
 
+  PetscLogDouble nullspace_start = 0.0;
+  PetscLogDouble nullspace_end = 0.0;
+  KSPTUNE_PETSC_CALL(PetscTime(&nullspace_start));
   if(plan.nullspace_choice.enabled) {
     aggregate.nullspace_kind = plan.nullspace_choice.kind;
     aggregate.nullspace_actions = plan.actions.label;
@@ -1314,11 +1866,11 @@ PetscErrorCode replay_snapshot(const replay_args& args,
   }
 
   if(plan.nullspace_choice.enabled) {
-    MatNullSpace nullspace = nullptr;
+    petsc_nullspace nullspace;
     KSPTUNE_PETSC_CALL(create_replay_nullspace(
         plan.nullspace_choice,
         right_hand_side,
-        &nullspace));
+        nullspace.ptr()));
     KSPTUNE_PETSC_CALL(apply_nullspace_actions(
         matrix,
         right_hand_side,
@@ -1326,56 +1878,55 @@ PetscErrorCode replay_snapshot(const replay_args& args,
         plan.actions,
         aggregate,
         !ksp_context_hit));
-    KSPTUNE_PETSC_CALL(MatNullSpaceDestroy(&nullspace));
+    KSPTUNE_PETSC_CALL(nullspace.reset());
   }
+  KSPTUNE_PETSC_CALL(PetscTime(&nullspace_end));
+  double nullspace_elapsed = double(nullspace_end - nullspace_start);
+  MPI_Allreduce(MPI_IN_PLACE, &nullspace_elapsed, 1, MPI_DOUBLE, MPI_MAX, PETSC_COMM_WORLD);
+  aggregate.nullspace_time_sec += nullspace_elapsed;
 
   PetscLogDouble t0 = 0.0;
   PetscLogDouble t1 = 0.0;
-  if(ksp_context_hit) {
-    aggregate.solver_setup_time_sec += ksp_context->setup_time_sec;
-    aggregate.solver_setup_time_sec_logical += ksp_context->setup_time_sec;
-    aggregate.ksp_type = ksp_context->ksp_type;
-    aggregate.pc_type = ksp_context->pc_type;
-  } else {
+  KSPTUNE_PETSC_CALL(memory.sample(aggregate, "before_setup", snap.solve_index, snap.snapshot_id));
+  if(!ksp_context_hit) {
     if(snap.symmetric) KSPTUNE_PETSC_CALL(MatSetOption(matrix, MAT_SYMMETRIC, PETSC_TRUE));
     if(snap.spd) KSPTUNE_PETSC_CALL(MatSetOption(matrix, MAT_SPD, PETSC_TRUE));
-
-    KSPTUNE_PETSC_CALL(create_configured_ksp(snap, matrix, &ksp));
+    KSPTUNE_PETSC_CALL(create_configured_ksp(args, snap, matrix, context.ksp.ptr()));
     KSPTUNE_PETSC_CALL(PetscTime(&t0));
-    KSPTUNE_PETSC_CALL(KSPSetUp(ksp));
+    KSPTUNE_PETSC_CALL(KSPSetUp(context.ksp));
     KSPTUNE_PETSC_CALL(PetscTime(&t1));
-    double setup_elapsed = double(t1 - t0);
-    MPI_Allreduce(MPI_IN_PLACE, &setup_elapsed, 1, MPI_DOUBLE, MPI_MAX, PETSC_COMM_WORLD);
-    aggregate.solver_setup_time_sec += setup_elapsed;
-    aggregate.solver_setup_time_sec_actual += setup_elapsed;
-    aggregate.solver_setup_time_sec_logical += setup_elapsed;
+    double elapsed = double(t1 - t0);
+    MPI_Allreduce(MPI_IN_PLACE, &elapsed, 1, MPI_DOUBLE, MPI_MAX, PETSC_COMM_WORLD);
+    context.setup_time_sec = elapsed;
+    aggregate.solver_setup_time_sec_actual += elapsed;
     ++aggregate.ksp_setup_cache_misses;
-
-    if(cache_ksp_setup) {
-      ksp_context->ksp = ksp;
-      ksp_context->setup_time_sec = setup_elapsed;
-      ksp_context->matrix_cache_key = plan.matrix_cache_key;
-      ksp_context->last_used = ++cache_metadata.clock;
-      KSPTUNE_PETSC_CALL(record_ksp_types(
-          ksp,
-          aggregate,
-          ksp_context->ksp_type,
-          ksp_context->pc_type));
-      ksp_owned_by_cache = true;
-    } else {
-      std::string ksp_type_text;
-      std::string pc_type_text;
-      KSPTUNE_PETSC_CALL(record_ksp_types(ksp, aggregate, ksp_type_text, pc_type_text));
-    }
   }
+  aggregate.solver_setup_time_sec += context.setup_time_sec;
+  aggregate.solver_setup_time_sec_logical += context.setup_time_sec;
+  KSP ksp = context.ksp;
+  KSPTUNE_PETSC_CALL(record_ksp_types(ksp, aggregate));
+  KSPTUNE_PETSC_CALL(record_ksp_residual_norm_type(ksp, aggregate));
+  KSPTUNE_PETSC_CALL(record_ksp_tolerances(ksp, aggregate));
+  KSPTUNE_PETSC_CALL(record_pc_diagnostics_once(
+      ksp, plan.ksp_setup_cache_key, args.json_output_path, aggregate));
+  KSPTUNE_PETSC_CALL(memory.sample(aggregate, "after_setup", snap.solve_index, snap.snapshot_id));
 
+  KSPTUNE_PETSC_CALL(memory.sample(aggregate, "before_solve", snap.solve_index, snap.snapshot_id));
   for(int iteration = 0; iteration < args.warmup + args.repeat; ++iteration) {
     const bool measured_iteration = iteration >= args.warmup;
-    KSPTUNE_PETSC_CALL(VecCopy(initial_guess, solution));
+    if(args.use_initial_guess) {
+      KSPTUNE_PETSC_CALL(VecCopy(initial_guess, solution));
+    } else {
+      KSPTUNE_PETSC_CALL(VecSet(solution, 0.0));
+    }
+    KSPTUNE_PETSC_CALL(prepare_ksp_residual_history(ksp, context.residual_history));
 
     double initial_residual = 0.0;
     double rhs_norm = 0.0;
     double initial_relative = 0.0;
+    PetscLogDouble residual_start = 0.0;
+    PetscLogDouble residual_end = 0.0;
+    KSPTUNE_PETSC_CALL(PetscTime(&residual_start));
     KSPTUNE_PETSC_CALL(compute_residual_norm(
         matrix,
         right_hand_side,
@@ -1383,29 +1934,75 @@ PetscErrorCode replay_snapshot(const replay_args& args,
         initial_residual,
         rhs_norm,
         initial_relative));
+    KSPTUNE_PETSC_CALL(PetscTime(&residual_end));
+    double true_residual_elapsed = double(residual_end - residual_start);
+    MPI_Allreduce(MPI_IN_PLACE, &true_residual_elapsed, 1, MPI_DOUBLE, MPI_MAX, PETSC_COMM_WORLD);
+    aggregate.true_residual_time_sec += true_residual_elapsed;
 
     KSPTUNE_PETSC_CALL(PetscTime(&t0));
+    soft_timeout_convergence_context soft_timeout_context;
+    bool soft_timeout_installed = false;
+    if(aggregate.soft_timeout_sec >= 0.0) {
+      KSPTUNE_PETSC_CALL(KSPGetAndClearConvergenceTest(
+          ksp,
+          &soft_timeout_context.original_converged,
+          &soft_timeout_context.original_context,
+          &soft_timeout_context.original_destroy));
+      soft_timeout_context.soft_timeout_sec = aggregate.soft_timeout_sec;
+      soft_timeout_context.solve_elapsed_before_sec = aggregate.soft_timeout_elapsed_sec;
+      soft_timeout_context.solve_start_time_sec = double(t0);
+      soft_timeout_context.soft_timeout_triggered = &aggregate.soft_timeout_triggered;
+      soft_timeout_context.soft_timeout_elapsed_sec = &aggregate.soft_timeout_elapsed_sec;
+      KSPTUNE_PETSC_CALL(KSPSetConvergenceTest(
+          ksp,
+          soft_timeout_converged,
+          &soft_timeout_context,
+          nullptr));
+      soft_timeout_installed = true;
+    }
     bool solve_stage_pushed = false;
     if(measured_iteration && solve_mpi_logging_enabled) {
       solve_stage_pushed = PetscLogStagePush(solve_log_stage) == 0;
     }
     const PetscErrorCode solve_error = KSPSolve(ksp, right_hand_side, solution);
     if(solve_stage_pushed) PetscLogStagePop();
+    PetscErrorCode restore_error = 0;
+    if(soft_timeout_installed) {
+      restore_error = KSPSetConvergenceTest(
+          ksp,
+          soft_timeout_context.original_converged,
+          soft_timeout_context.original_context,
+          soft_timeout_context.original_destroy);
+    }
     if(solve_error) return solve_error;
+    if(restore_error) return restore_error;
     KSPTUNE_PETSC_CALL(PetscTime(&t1));
     double solve_elapsed = double(t1 - t0);
     MPI_Allreduce(MPI_IN_PLACE, &solve_elapsed, 1, MPI_DOUBLE, MPI_MAX, PETSC_COMM_WORLD);
+    if(aggregate.soft_timeout_sec >= 0.0) {
+      const double solve_elapsed_before = soft_timeout_installed
+          ? soft_timeout_context.solve_elapsed_before_sec
+          : aggregate.soft_timeout_elapsed_sec;
+      aggregate.soft_timeout_elapsed_sec = solve_elapsed_before + solve_elapsed;
+    }
 
     KSPConvergedReason reason;
     PetscInt ksp_iterations = 0;
+    PetscReal final_ksp_residual_norm = 0.0;
     KSPTUNE_PETSC_CALL(KSPGetConvergedReason(ksp, &reason));
     KSPTUNE_PETSC_CALL(KSPGetIterationNumber(ksp, &ksp_iterations));
-    if(reason < 0) aggregate.converged = false;
-    aggregate.reason_code = int(reason);
+    KSPTUNE_PETSC_CALL(KSPGetResidualNorm(ksp, &final_ksp_residual_norm));
+    if(reason < 0) {
+      if(aggregate.converged) aggregate.reason_code = int(reason);
+      aggregate.converged = false;
+    } else if(aggregate.converged) {
+      aggregate.reason_code = int(reason);
+    }
 
     double final_residual = 0.0;
     double final_rhs_norm = 0.0;
     double final_relative = 0.0;
+    KSPTUNE_PETSC_CALL(PetscTime(&residual_start));
     KSPTUNE_PETSC_CALL(compute_residual_norm(
         matrix,
         right_hand_side,
@@ -1413,43 +2010,93 @@ PetscErrorCode replay_snapshot(const replay_args& args,
         final_residual,
         final_rhs_norm,
         final_relative));
+    KSPTUNE_PETSC_CALL(PetscTime(&residual_end));
+    true_residual_elapsed = double(residual_end - residual_start);
+    MPI_Allreduce(MPI_IN_PLACE, &true_residual_elapsed, 1, MPI_DOUBLE, MPI_MAX, PETSC_COMM_WORLD);
+    aggregate.true_residual_time_sec += true_residual_elapsed;
 
     if(measured_iteration) {
       step_result step;
       step.repeat_index = iteration - args.warmup;
       step.solve_index = snap.solve_index;
+      step.snapshot_id = snap.snapshot_id;
       step.solve_time_sec = solve_elapsed;
       step.initial_true_residual_norm = initial_residual;
       step.rhs_norm = rhs_norm;
       step.initial_true_relative_residual = initial_relative;
       step.final_true_residual_norm = final_residual;
       step.final_true_relative_residual = final_relative;
+      const PetscReal* ksp_residual_history_values = nullptr;
+      PetscInt ksp_residual_history_count = 0;
+      KSPTUNE_PETSC_CALL(KSPGetResidualHistory(
+          ksp,
+          &ksp_residual_history_values,
+          &ksp_residual_history_count));
+      if(ksp_residual_history_values && ksp_residual_history_count > 0) {
+        step.initial_ksp_residual_norm = double(ksp_residual_history_values[0]);
+      }
+      step.final_ksp_residual_norm = double(final_ksp_residual_norm);
+      const ksp_rtol_reference rtol_reference = get_ksp_rtol_reference(
+          ksp,
+          step.initial_ksp_residual_norm,
+          step.final_ksp_residual_norm,
+          aggregate.ksp_rtol,
+          aggregate.ksp_atol);
+      step.ksp_rtol_reference_norm = rtol_reference.norm;
+      step.ksp_convergence_threshold_norm = rtol_reference.threshold_norm;
+      step.final_ksp_relative_residual_norm = rtol_reference.relative_final_norm;
+      if(aggregate.ksp_rtol_reference_source.empty()) {
+        aggregate.ksp_rtol_reference_source = rtol_reference.source;
+      }
       step.iterations = int(ksp_iterations);
       step.reason_code = int(reason);
       aggregate.steps.push_back(step);
       solve_times.push_back(solve_elapsed);
       iteration_counts.push_back(double(ksp_iterations));
     }
+    if(aggregate.soft_timeout_triggered) break;
   }
+  KSPTUNE_PETSC_CALL(memory.sample(aggregate, "after_solve", snap.solve_index, snap.snapshot_id));
 
-  if(!ksp_owned_by_cache) KSPTUNE_PETSC_CALL(KSPDestroy(&ksp));
-  KSPTUNE_PETSC_CALL(VecDestroy(&solution));
-  KSPTUNE_PETSC_CALL(VecDestroy(&initial_guess));
-  KSPTUNE_PETSC_CALL(VecDestroy(&right_hand_side));
-  if(!matrix_owned_by_cache) KSPTUNE_PETSC_CALL(MatDestroy(&matrix));
+  KSPTUNE_PETSC_CALL(local_context.ksp.reset());
+  KSPTUNE_PETSC_CALL(solution.reset());
+  KSPTUNE_PETSC_CALL(initial_guess.reset());
+  KSPTUNE_PETSC_CALL(right_hand_side.reset());
+  KSPTUNE_PETSC_CALL(local_matrix.reset());
+  KSPTUNE_PETSC_CALL(memory.sample(aggregate, "after_snapshot_cleanup", snap.solve_index, snap.snapshot_id));
   return 0;
+}
+
+void read_solve_mpi_perf_info(PetscLogStage solve_log_stage,
+                              bool solve_mpi_logging_enabled,
+                              PetscEventPerfInfo& info)
+{
+  info = PetscEventPerfInfo{};
+  if(!solve_mpi_logging_enabled) return;
+  if(PetscLogStageGetPerfInfo(solve_log_stage, &info) != 0) {
+    info = PetscEventPerfInfo{};
+  }
+}
+
+double nonnegative_delta(PetscLogDouble after, PetscLogDouble before)
+{
+  return std::max(0.0, double(after - before));
 }
 
 void collect_solve_mpi_diagnostics(PetscLogStage solve_log_stage,
                                    bool solve_mpi_logging_enabled,
+                                   const PetscEventPerfInfo& solve_mpi_start_info,
                                    replay_result& result)
 {
   if(!solve_mpi_logging_enabled) return;
   PetscEventPerfInfo solve_info;
-  if(PetscLogStageGetPerfInfo(solve_log_stage, &solve_info) != 0) return;
-  double message_count_sum = double(solve_info.numMessages);
-  double message_bytes_sum = double(solve_info.messageLength);
-  double reduction_count_sum = double(solve_info.numReductions);
+  read_solve_mpi_perf_info(solve_log_stage, solve_mpi_logging_enabled, solve_info);
+  double message_count_sum =
+      nonnegative_delta(solve_info.numMessages, solve_mpi_start_info.numMessages);
+  double message_bytes_sum =
+      nonnegative_delta(solve_info.messageLength, solve_mpi_start_info.messageLength);
+  double reduction_count_sum =
+      nonnegative_delta(solve_info.numReductions, solve_mpi_start_info.numReductions);
   MPI_Allreduce(MPI_IN_PLACE, &message_count_sum, 1, MPI_DOUBLE, MPI_SUM, PETSC_COMM_WORLD);
   MPI_Allreduce(MPI_IN_PLACE, &message_bytes_sum, 1, MPI_DOUBLE, MPI_SUM, PETSC_COMM_WORLD);
   MPI_Allreduce(MPI_IN_PLACE, &reduction_count_sum, 1, MPI_DOUBLE, MPI_SUM, PETSC_COMM_WORLD);
@@ -1466,175 +2113,165 @@ void collect_solve_mpi_diagnostics(PetscLogStage solve_log_stage,
       : 0.0;
 }
 
-std::string json_escape(const std::string& input)
+PetscErrorCode write_json_result(const replay_result& result, const std::string& path)
 {
-  std::ostringstream output;
-  for(char c : input) {
-    if(c == '\\' || c == '"') output << '\\' << c;
-    else if(c == '\n') output << "\\n";
-    else output << c;
+  json output = {
+    {"objective_time_sec_median", result.objective_time_sec_median},
+    {"total_wall_time_sec", result.total_wall_time_sec},
+    {"matrix_load_time_sec", result.matrix_load_time_sec},
+    {"matrix_prepare_time_sec", result.matrix_prepare_time_sec},
+    {"vector_prepare_time_sec", result.vector_prepare_time_sec},
+    {"nullspace_time_sec", result.nullspace_time_sec},
+    {"true_residual_time_sec", result.true_residual_time_sec},
+    {"use_initial_guess", result.use_initial_guess},
+    {"soft_timeout_sec", result.soft_timeout_sec},
+    {"soft_timeout_elapsed_sec", result.soft_timeout_elapsed_sec},
+    {"soft_timeout_triggered", result.soft_timeout_triggered},
+    {"matrix_cache_hits", result.matrix_cache_hits},
+    {"matrix_cache_misses", result.matrix_cache_misses},
+    {"replay_cache_memory_mb", result.replay_cache_memory_mb},
+    {"matrix_cache_memory_mb", result.matrix_cache_memory_mb},
+    {"vector_cache_memory_mb", result.vector_cache_memory_mb},
+    {"replay_cache_memory_limit_mb", result.replay_cache_memory_limit_mb},
+    {"replay_cache_evictions", result.replay_cache_evictions},
+    {"solver_setup_time_sec", result.solver_setup_time_sec},
+    {"solver_setup_time_sec_actual", result.solver_setup_time_sec_actual},
+    {"solver_setup_time_sec_logical", result.solver_setup_time_sec_logical},
+    {"ksp_setup_cache_hits", result.ksp_setup_cache_hits},
+    {"ksp_setup_cache_misses", result.ksp_setup_cache_misses},
+    {"solve_time_sec_total", result.solve_time_sec_total},
+    {"solve_time_sec_mean", result.solve_time_sec_mean},
+    {"solve_time_sec_median", result.solve_time_sec_median},
+    {"solve_time_sec_min", result.solve_time_sec_min},
+    {"solve_time_sec_max", result.solve_time_sec_max},
+    {"solve_time_sec_stddev", result.solve_time_sec_stddev},
+    {"solve_time_sec_sem", result.solve_count > 1 ? json(result.solve_time_sec_sem) : json(nullptr)},
+    {"solve_time_sec_relative_sem", result.solve_count > 1 ? json(result.solve_time_sec_relative_sem) : json(nullptr)},
+    {"solve_time_sec_range", result.solve_time_sec_range},
+    {"solve_mpi_message_count", result.solve_mpi_message_count},
+    {"solve_mpi_message_bytes", result.solve_mpi_message_bytes},
+    {"solve_mpi_message_bytes_mean", result.solve_mpi_message_bytes_mean},
+    {"solve_mpi_reduction_count", result.solve_mpi_reduction_count},
+    {"initial_true_residual_norm_mean", result.initial_true_residual_norm_mean},
+    {"initial_true_relative_residual_mean", result.initial_true_relative_residual_mean},
+    {"final_true_residual_norm_mean", result.final_true_residual_norm_mean},
+    {"final_true_relative_residual_mean", result.final_true_relative_residual_mean},
+    {"initial_ksp_residual_norm_mean", result.initial_ksp_residual_norm_mean},
+    {"final_ksp_residual_norm_mean", result.final_ksp_residual_norm_mean},
+    {"ksp_rtol_reference_norm_mean", result.ksp_rtol_reference_norm_mean},
+    {"ksp_convergence_threshold_norm_mean", result.ksp_convergence_threshold_norm_mean},
+    {"final_ksp_relative_residual_norm_mean", result.final_ksp_relative_residual_norm_mean},
+    {"ksp_residual_norm_type", result.ksp_residual_norm_type},
+    {"ksp_rtol_reference_source", result.ksp_rtol_reference_source},
+    {"ksp_rtol", result.ksp_rtol},
+    {"ksp_atol", result.ksp_atol},
+    {"ksp_dtol", result.ksp_dtol},
+    {"ksp_max_it", result.ksp_max_it},
+    {"rss_request_start_mb_sum", result.rss_request_start_mb_sum},
+    {"rss_request_end_mb_sum", result.rss_request_end_mb_sum},
+    {"rss_request_peak_sample_mb_sum", result.rss_request_peak_sample_mb_sum},
+    {"rss_request_delta_mb_sum", result.rss_request_delta_mb_sum},
+    {"rss_setup_delta_mb_sum", result.rss_setup_delta_mb_sum},
+    {"rss_solve_delta_mb_sum", result.rss_solve_delta_mb_sum},
+    {"rss_peak_sample_mb_max_rank", result.rss_peak_sample_mb_max_rank},
+    {"rss_peak_sample_mb_max_node", result.rss_peak_sample_mb_max_node},
+    {"converged", result.converged},
+    {"reason", reason_string(result.reason_code)},
+    {"reason_code", result.reason_code},
+    {"iterations_median", result.iterations_median},
+    {"iterations_total", result.iterations_total},
+    {"snapshots", result.snapshots},
+    {"repeat", result.repeat},
+    {"warmup", result.warmup},
+    {"solve_count", result.solve_count},
+    {"nullspace", result.nullspace},
+    {"nullspace_source", result.nullspace_source},
+    {"nullspace_kind", result.nullspace_kind},
+    {"nullspace_actions", result.nullspace_actions},
+    {"field_nullspace_index", result.field_nullspace_index},
+    {"field_nullspace_block_size", result.field_nullspace_block_size},
+    {"matrix_nullspace_attached_count", result.matrix_nullspace_attached_count},
+    {"transpose_nullspace_attached_count", result.transpose_nullspace_attached_count},
+    {"near_nullspace_attached_count", result.near_nullspace_attached_count},
+    {"rhs_nullspace_removed_count", result.rhs_nullspace_removed_count},
+    {"rhs_nullspace_removed_component_norm_max", result.rhs_nullspace_removed_component_norm_max},
+    {"rhs_nullspace_removed_component_relative_norm_max", result.rhs_nullspace_removed_component_relative_norm_max},
+    {"ksp_type", result.ksp_type},
+    {"pc_type", result.pc_type},
+    {"schema_version", 1}
+  };
+  output["memory_samples"] = json::array();
+  for(const memory_sample& sample : result.memory_samples) {
+    json entry = {
+      {"phase", sample.phase},
+      {"solve_index", sample.solve_index},
+      {"snapshot_id", sample.snapshot_id},
+      {"rss_mb_sum", sample.rss_mb_sum},
+      {"rss_mb_max_rank", sample.rss_mb_max_rank},
+      {"rss_mb_max_node", sample.rss_mb_max_node}
+    };
+    output["memory_samples"].push_back(std::move(entry));
   }
-  return output.str();
+  output["matrices"] = json::array();
+  for(const matrix_diagnostics& matrix : result.matrices) {
+    json entry = {
+      {"row_count", matrix.row_count},
+      {"column_count", matrix.column_count},
+      {"local_row_count", matrix.local_row_count},
+      {"local_column_count", matrix.local_column_count},
+      {"nonzero_count", matrix.nonzero_count},
+      {"allocated_nonzero_count", matrix.allocated_nonzero_count},
+      {"petsc_matrix_memory_bytes", matrix.petsc_matrix_memory_bytes},
+      {"estimated_matrix_memory_bytes", matrix.estimated_matrix_memory_bytes},
+      {"rows", matrix.row_count},
+      {"cols", matrix.column_count},
+      {"local_rows", matrix.local_row_count},
+      {"local_cols", matrix.local_column_count},
+      {"nonzeros_used", matrix.nonzero_count},
+      {"nonzeros_allocated", matrix.allocated_nonzero_count},
+      {"memory_bytes", matrix.estimated_matrix_memory_bytes},
+      {"symmetric_tested", matrix.symmetric_tested},
+      {"symmetric", matrix.symmetric}
+    };
+    output["matrices"].push_back(std::move(entry));
+  }
+  output["steps"] = json::array();
+  for(const step_result& step : result.steps) {
+    json entry = {
+      {"repeat_index", step.repeat_index},
+      {"solve_index", step.solve_index},
+      {"snapshot_id", step.snapshot_id},
+      {"solve_time_sec", step.solve_time_sec},
+      {"initial_true_residual_norm", step.initial_true_residual_norm},
+      {"rhs_norm", step.rhs_norm},
+      {"initial_true_relative_residual", step.initial_true_relative_residual},
+      {"final_true_residual_norm", step.final_true_residual_norm},
+      {"final_true_relative_residual", step.final_true_relative_residual},
+      {"initial_ksp_residual_norm", step.initial_ksp_residual_norm},
+      {"final_ksp_residual_norm", step.final_ksp_residual_norm},
+      {"ksp_rtol_reference_norm", step.ksp_rtol_reference_norm},
+      {"ksp_convergence_threshold_norm", step.ksp_convergence_threshold_norm},
+      {"final_ksp_relative_residual_norm", step.final_ksp_relative_residual_norm},
+      {"iterations", step.iterations},
+      {"reason", reason_string(step.reason_code)},
+      {"reason_code", step.reason_code}
+    };
+    output["steps"].push_back(std::move(entry));
+  }
+  output["pc_diagnostics"] = json::array();
+  for(const auto& record : result.pc_diagnostics) {
+    json entry = {{"pc_type", record.pc_type}, {"setup_index", record.setup_index},
+                  {"setup_key", record.setup_key}, {"metrics", record.metrics},
+                  {"string_metrics", record.string_metrics}, {"levels", json::array()}};
+    for(const auto& level : record.levels) {
+      entry["levels"].push_back({{"level", level.level}, {"level_from_finest", level.level_from_finest},
+                                 {"metrics", level.metrics}, {"string_metrics", level.string_metrics}});
+    }
+    output["pc_diagnostics"].push_back(std::move(entry));
+  }
+  return ksptune::write_json_output(output, path);
 }
 
-void write_json_result(const replay_result& result, const std::string& path)
-{
-  int rank = 0;
-  MPI_Comm_rank(PETSC_COMM_WORLD, &rank);
-  if(rank != 0) return;
-
-  std::ostringstream json;
-  json << std::setprecision(17)
-       << "{\n"
-       << "  \"objective_time_sec_median\": " << result.objective_time_sec_median << ",\n"
-       << "  \"total_wall_time_sec\": " << result.total_wall_time_sec << ",\n"
-       << "  \"matrix_load_time_sec\": " << result.matrix_load_time_sec << ",\n"
-       << "  \"matrix_cache_hits\": " << result.matrix_cache_hits << ",\n"
-       << "  \"matrix_cache_misses\": " << result.matrix_cache_misses << ",\n"
-       << "  \"replay_cache_memory_mb\": " << result.replay_cache_memory_mb << ",\n"
-       << "  \"replay_cache_memory_limit_mb\": "
-       << result.replay_cache_memory_limit_mb << ",\n"
-       << "  \"replay_cache_evictions\": " << result.replay_cache_evictions << ",\n"
-       << "  \"solver_setup_time_sec\": " << result.solver_setup_time_sec << ",\n"
-       << "  \"solver_setup_time_sec_actual\": "
-       << result.solver_setup_time_sec_actual << ",\n"
-       << "  \"solver_setup_time_sec_logical\": "
-       << result.solver_setup_time_sec_logical << ",\n"
-       << "  \"ksp_setup_cache_hits\": " << result.ksp_setup_cache_hits << ",\n"
-       << "  \"ksp_setup_cache_misses\": " << result.ksp_setup_cache_misses << ",\n"
-       << "  \"solve_time_sec_total\": " << result.solve_time_sec_total << ",\n"
-       << "  \"solve_time_sec_mean\": " << result.solve_time_sec_mean << ",\n"
-       << "  \"solve_time_sec_median\": " << result.solve_time_sec_median << ",\n"
-       << "  \"solve_time_sec_min\": " << result.solve_time_sec_min << ",\n"
-       << "  \"solve_time_sec_max\": " << result.solve_time_sec_max << ",\n"
-       << "  \"solve_time_sec_stddev\": " << result.solve_time_sec_stddev << ",\n"
-       << "  \"solve_time_sec_range\": " << result.solve_time_sec_range << ",\n"
-       << "  \"solve_mpi_message_count\": " << result.solve_mpi_message_count << ",\n"
-       << "  \"solve_mpi_message_bytes\": " << result.solve_mpi_message_bytes << ",\n"
-       << "  \"solve_mpi_message_bytes_mean\": "
-       << result.solve_mpi_message_bytes_mean << ",\n"
-       << "  \"solve_mpi_reduction_count\": " << result.solve_mpi_reduction_count << ",\n"
-       << "  \"initial_true_residual_norm_mean\": "
-       << result.initial_true_residual_norm_mean << ",\n"
-       << "  \"initial_true_relative_residual_mean\": "
-       << result.initial_true_relative_residual_mean << ",\n"
-       << "  \"final_true_residual_norm_mean\": "
-       << result.final_true_residual_norm_mean << ",\n"
-       << "  \"final_true_relative_residual_mean\": "
-       << result.final_true_relative_residual_mean << ",\n"
-       << "  \"initial_residual_norm_mean\": " << result.initial_true_residual_norm_mean << ",\n"
-       << "  \"initial_relative_residual_mean\": "
-       << result.initial_true_relative_residual_mean << ",\n"
-       << "  \"final_residual_norm_mean\": " << result.final_true_residual_norm_mean << ",\n"
-       << "  \"final_relative_residual_mean\": "
-       << result.final_true_relative_residual_mean << ",\n"
-       << "  \"peak_memory_mb_per_rank\": [";
-  for(size_t i = 0; i < result.peak_memory_mb_per_rank.size(); ++i) {
-    if(i > 0) json << ", ";
-    json << result.peak_memory_mb_per_rank[i];
-  }
-  json << "],\n"
-       << "  \"peak_memory_mb_max_per_rank\": " << result.peak_memory_mb_max_per_rank << ",\n"
-       << "  \"peak_memory_mb_mean_per_rank\": " << result.peak_memory_mb_mean_per_rank
-       << ",\n"
-       << "  \"peak_memory_mb_sum\": " << result.peak_memory_mb_sum << ",\n"
-       << "  \"peak_memory_rank_count\": " << result.peak_memory_rank_count << ",\n"
-       << "  \"converged\": " << (result.converged ? "true" : "false") << ",\n"
-       << "  \"reason\": \"" << reason_string(result.reason_code) << "\",\n"
-       << "  \"reason_code\": " << result.reason_code << ",\n"
-       << "  \"iterations_median\": " << result.iterations_median << ",\n"
-       << "  \"iterations_total\": " << result.iterations_total << ",\n"
-       << "  \"snapshots\": " << result.snapshots << ",\n"
-       << "  \"repeat\": " << result.repeat << ",\n"
-       << "  \"warmup\": " << result.warmup << ",\n"
-       << "  \"solve_count\": " << result.solve_count << ",\n"
-       << "  \"nullspace\": \"" << json_escape(result.nullspace) << "\",\n"
-       << "  \"nullspace_source\": \"" << json_escape(result.nullspace_source) << "\",\n"
-       << "  \"nullspace_kind\": \"" << json_escape(result.nullspace_kind) << "\",\n"
-       << "  \"nullspace_actions\": \"" << json_escape(result.nullspace_actions) << "\",\n"
-       << "  \"field_nullspace_index\": " << result.field_nullspace_index << ",\n"
-       << "  \"field_nullspace_block_size\": " << result.field_nullspace_block_size << ",\n"
-       << "  \"matrix_nullspace_attached_count\": "
-       << result.matrix_nullspace_attached_count << ",\n"
-       << "  \"transpose_nullspace_attached_count\": "
-       << result.transpose_nullspace_attached_count << ",\n"
-       << "  \"near_nullspace_attached_count\": "
-       << result.near_nullspace_attached_count << ",\n"
-       << "  \"rhs_nullspace_removed_count\": "
-       << result.rhs_nullspace_removed_count << ",\n"
-       << "  \"rhs_nullspace_removed_component_norm_max\": "
-       << result.rhs_nullspace_removed_component_norm_max << ",\n"
-       << "  \"rhs_nullspace_removed_component_relative_norm_max\": "
-       << result.rhs_nullspace_removed_component_relative_norm_max << ",\n"
-       << "  \"ksp_type\": \"" << json_escape(result.ksp_type) << "\",\n"
-       << "  \"pc_type\": \"" << json_escape(result.pc_type) << "\",\n"
-       << "  \"matrices\": [\n";
-  for(size_t i = 0; i < result.matrices.size(); ++i) {
-    const matrix_diagnostics& matrix = result.matrices[i];
-    json << "    {"
-         << "\"row_count\": " << matrix.row_count << ", "
-         << "\"column_count\": " << matrix.column_count << ", "
-         << "\"local_row_count\": " << matrix.local_row_count << ", "
-         << "\"local_column_count\": " << matrix.local_column_count << ", "
-         << "\"nonzero_count\": " << matrix.nonzero_count << ", "
-         << "\"allocated_nonzero_count\": " << matrix.allocated_nonzero_count << ", "
-         << "\"petsc_matrix_memory_bytes\": " << matrix.petsc_matrix_memory_bytes << ", "
-         << "\"rows\": " << matrix.row_count << ", "
-         << "\"cols\": " << matrix.column_count << ", "
-         << "\"local_rows\": " << matrix.local_row_count << ", "
-         << "\"local_cols\": " << matrix.local_column_count << ", "
-         << "\"nonzeros_used\": " << matrix.nonzero_count << ", "
-         << "\"nonzeros_allocated\": " << matrix.allocated_nonzero_count << ", "
-         << "\"memory_bytes\": " << matrix.petsc_matrix_memory_bytes << ", "
-         << "\"symmetric_tested\": " << (matrix.symmetric_tested ? "true" : "false") << ", "
-         << "\"symmetric\": " << (matrix.symmetric ? "true" : "false") << "}";
-    if(i + 1 < result.matrices.size()) json << ",";
-    json << "\n";
-  }
-  json << "  ],\n"
-       << "  \"steps\": [\n";
-  for(size_t i = 0; i < result.steps.size(); ++i) {
-    const step_result& step = result.steps[i];
-    json << "    {"
-         << "\"repeat_index\": " << step.repeat_index << ", "
-         << "\"solve_index\": " << step.solve_index << ", "
-         << "\"solve_time_sec\": " << step.solve_time_sec << ", "
-         << "\"initial_true_residual_norm\": " << step.initial_true_residual_norm << ", "
-         << "\"rhs_norm\": " << step.rhs_norm << ", "
-         << "\"initial_true_relative_residual\": "
-         << step.initial_true_relative_residual << ", "
-         << "\"final_true_residual_norm\": " << step.final_true_residual_norm << ", "
-         << "\"final_true_relative_residual\": "
-         << step.final_true_relative_residual << ", "
-         << "\"initial_residual_norm\": " << step.initial_true_residual_norm << ", "
-         << "\"initial_relative_residual\": "
-         << step.initial_true_relative_residual << ", "
-         << "\"final_residual_norm\": " << step.final_true_residual_norm << ", "
-         << "\"final_relative_residual\": " << step.final_true_relative_residual << ", "
-         << "\"iterations\": " << step.iterations << ", "
-         << "\"reason\": \"" << reason_string(step.reason_code) << "\", "
-         << "\"reason_code\": " << step.reason_code << "}";
-    if(i + 1 < result.steps.size()) json << ",";
-    json << "\n";
-  }
-  json << "  ]\n"
-       << "}\n";
-
-  if(path.empty()) {
-    std::cout << json.str();
-  } else {
-    std::ofstream output(path.c_str());
-    output << json.str();
-  }
-}
-
-int find_snapshot_by_solve_index(const std::vector<snapshot>& snapshots, int solve_index)
-{
-  for(size_t i = 0; i < snapshots.size(); ++i) {
-    if(snapshots[i].solve_index == solve_index) return int(i);
-  }
-  return -1;
-}
 
 bool option_token(const std::string& token)
 {
@@ -1684,111 +2321,72 @@ struct replay_server_request {
   int repeat = -1;
   int warmup = -1;
   int solve_target = -2;
+  std::string snapshot_id;
+  double soft_timeout_sec = -1.0;
 };
 
-bool json_skip_ws(const std::string& text, size_t& position)
+bool parse_replay_server_request(const std::string& line,
+                                 replay_server_request& request,
+                                 std::string& error)
 {
-  while(position < text.size() &&
-        std::isspace(static_cast<unsigned char>(text[position]))) {
-    ++position;
-  }
-  return position < text.size();
-}
-
-bool json_parse_string_at(const std::string& text, size_t& position, std::string& value)
-{
-  if(!json_skip_ws(text, position) || text[position] != '"') return false;
-  ++position;
-  value.clear();
-  while(position < text.size()) {
-    const char current = text[position++];
-    if(current == '"') return true;
-    if(current == '\\') {
-      if(position >= text.size()) return false;
-      const char escaped = text[position++];
-      if(escaped == '"' || escaped == '\\' || escaped == '/') value.push_back(escaped);
-      else if(escaped == 'n') value.push_back('\n');
-      else if(escaped == 'r') value.push_back('\r');
-      else if(escaped == 't') value.push_back('\t');
-      else return false;
-    } else {
-      value.push_back(current);
-    }
-  }
-  return false;
-}
-
-bool json_field_position(const std::string& text, const std::string& field, size_t& position)
-{
-  const std::string pattern = "\"" + field + "\"";
-  position = text.find(pattern);
-  if(position == std::string::npos) return false;
-  position += pattern.size();
-  if(!json_skip_ws(text, position) || text[position] != ':') return false;
-  ++position;
-  return true;
-}
-
-bool json_string_field(const std::string& text, const std::string& field, std::string& value)
-{
-  size_t position = 0;
-  if(!json_field_position(text, field, position)) return false;
-  return json_parse_string_at(text, position, value);
-}
-
-bool json_int_field(const std::string& text, const std::string& field, int& value)
-{
-  size_t position = 0;
-  if(!json_field_position(text, field, position)) return false;
-  if(!json_skip_ws(text, position)) return false;
-  char* end = nullptr;
-  const long parsed = std::strtol(text.c_str() + position, &end, 10);
-  if(end == text.c_str() + position) return false;
-  value = int(parsed);
-  return true;
-}
-
-bool json_string_array_field(const std::string& text,
-                             const std::string& field,
-                             std::vector<std::string>& values)
-{
-  size_t position = 0;
-  if(!json_field_position(text, field, position)) return false;
-  if(!json_skip_ws(text, position) || text[position] != '[') return false;
-  ++position;
-  values.clear();
-  while(true) {
-    if(!json_skip_ws(text, position)) return false;
-    if(text[position] == ']') {
-      ++position;
-      return true;
-    }
-    std::string value;
-    if(!json_parse_string_at(text, position, value)) return false;
-    values.push_back(value);
-    if(!json_skip_ws(text, position)) return false;
-    if(text[position] == ',') {
-      ++position;
-      continue;
-    }
-    if(text[position] == ']') {
-      ++position;
-      return true;
-    }
+  const auto invalid = [&](const std::string& message) {
+    error = "invalid replay server request: " + message;
     return false;
+  };
+  const json value = json::parse(line, nullptr, false);
+  if(!value.is_object()) return invalid("expected a JSON object");
+  if(!value.contains("id") || !value["id"].is_string()) return invalid("id must be a string");
+  request.id = value["id"].get<std::string>();
+  if(request.id.empty()) return invalid("id must not be empty");
+  if(value.contains("command")) {
+    if(!value["command"].is_string()) return invalid("command must be a string");
+    request.command = value["command"].get<std::string>();
+    if(request.command == "shutdown") return true;
+    if(!request.command.empty()) return invalid("unknown command");
   }
-}
-
-bool parse_replay_server_request(const std::string& line, replay_server_request& request)
-{
-  json_string_field(line, "id", request.id);
-  json_string_field(line, "command", request.command);
-  json_string_field(line, "replay_json_out", request.replay_json_out);
-  json_string_array_field(line, "petsc_options", request.petsc_options);
-  json_int_field(line, "repeat", request.repeat);
-  json_int_field(line, "warmup", request.warmup);
-  json_int_field(line, "solve_target", request.solve_target);
-  return !request.command.empty() || !request.replay_json_out.empty();
+  if(!value.contains("replay_json_out") || !value["replay_json_out"].is_string()) {
+    return invalid("replay_json_out must be a string");
+  }
+  request.replay_json_out = value["replay_json_out"].get<std::string>();
+  if(request.replay_json_out.empty() || request.replay_json_out.find('\0') != std::string::npos) {
+    return invalid("replay_json_out must be a nonempty path without NUL");
+  }
+  if(!value.contains("petsc_options") || !value["petsc_options"].is_array()) {
+    return invalid("petsc_options must be an array of strings");
+  }
+  for(const auto& item : value["petsc_options"]) {
+    if(!item.is_string()) return invalid("PETSc options must be strings");
+    const auto option = item.get<std::string>();
+    if(option.find('\0') != std::string::npos) return invalid("PETSc option contains NUL");
+    request.petsc_options.push_back(option);
+  }
+  const auto read_integer = [&](const char* name, int minimum, int& destination) {
+    if(!value.contains(name)) return true;
+    const auto& number = value[name];
+    if(!number.is_number_integer() || number < minimum || number > std::numeric_limits<int>::max()) {
+      return invalid(std::string(name) + " is outside its integer range");
+    }
+    destination = number.get<int>();
+    return true;
+  };
+  if(!read_integer("repeat", 1, request.repeat) ||
+     !read_integer("warmup", 0, request.warmup) ||
+     !read_integer("solve_target", -1, request.solve_target)) return false;
+  if(value.contains("snapshot_id")) {
+    if(!value["snapshot_id"].is_string() || value["snapshot_id"].get<std::string>().empty()) {
+      return invalid("snapshot_id must be a nonempty string");
+    }
+    request.snapshot_id = value["snapshot_id"].get<std::string>();
+  }
+  if(value.contains("soft_timeout_sec")) {
+    const auto& timeout = value["soft_timeout_sec"];
+    if(!timeout.is_number()) return invalid("soft_timeout_sec must be numeric");
+    request.soft_timeout_sec = timeout.get<double>();
+    if(!std::isfinite(request.soft_timeout_sec) || request.soft_timeout_sec < 0.0) {
+      return invalid("soft_timeout_sec must be finite and nonnegative");
+    }
+  }
+  return true;
 }
 
 bool broadcast_server_line(std::string& line)
@@ -1819,12 +2417,9 @@ void write_server_response(const std::string& id,
   int rank = 0;
   MPI_Comm_rank(PETSC_COMM_WORLD, &rank);
   if(rank != 0) return;
-  std::cout << "{\"id\":\"" << json_escape(id) << "\","
-            << "\"returncode\":" << returncode;
-  if(!failure_reason.empty()) {
-    std::cout << ",\"failure_reason\":\"" << json_escape(failure_reason) << "\"";
-  }
-  std::cout << "}" << std::endl;
+  json response = {{"id", id}, {"returncode", returncode}};
+  if(!failure_reason.empty()) response["failure_reason"] = failure_reason;
+  std::cout << response.dump() << std::endl;
 }
 
 PetscErrorCode selected_snapshots(const replay_args& args,
@@ -1832,119 +2427,12 @@ PetscErrorCode selected_snapshots(const replay_args& args,
                                   std::vector<snapshot>& snapshots)
 {
   snapshots = all_snapshots;
-  if(args.solve_target < 0) return 0;
-
-  const int position = find_snapshot_by_solve_index(all_snapshots, args.solve_target);
-  if(position < 0) {
-    PetscFPrintf(
-        PETSC_COMM_WORLD,
-        stderr,
-        "No snapshot with solve_index %d\n",
-        args.solve_target);
-    return PETSC_ERR_ARG_WRONG;
-  }
-  snapshots = {all_snapshots[static_cast<size_t>(position)]};
-  return 0;
-}
-
-PetscErrorCode destroy_replay_caches(std::map<std::string, Mat>& matrix_cache,
-                                     std::map<std::string, vector_cache_context>& vector_cache,
-                                     replay_cache_metadata& cache_metadata,
-                                     std::map<std::string, ksp_setup_context>& ksp_context_cache)
-{
-  for(auto& cached_context : ksp_context_cache) {
-    if(cached_context.second.ksp) KSPTUNE_PETSC_CALL(KSPDestroy(&cached_context.second.ksp));
-  }
-  ksp_context_cache.clear();
-  for(auto& cached_matrix : matrix_cache) {
-    KSPTUNE_PETSC_CALL(MatDestroy(&cached_matrix.second));
-  }
-  matrix_cache.clear();
-  cache_metadata.matrix_memory_mb.clear();
-  cache_metadata.matrix_last_used.clear();
-  for(auto& cached_vector : vector_cache) {
-    if(cached_vector.second.vector) KSPTUNE_PETSC_CALL(VecDestroy(&cached_vector.second.vector));
-  }
-  vector_cache.clear();
-  return 0;
-}
-
-double replay_cache_memory_mb(const std::map<std::string, vector_cache_context>& vector_cache,
-                              const replay_cache_metadata& cache_metadata)
-{
-  double memory_mb = 0.0;
-  for(const auto& item : cache_metadata.matrix_memory_mb) {
-    memory_mb += item.second;
-  }
-  for(const auto& item : vector_cache) {
-    memory_mb += item.second.memory_mb;
-  }
-  return memory_mb;
-}
-
-PetscErrorCode evict_replay_cache_if_needed(double memory_limit_mb,
-                                            std::map<std::string, Mat>& matrix_cache,
-                                            std::map<std::string, vector_cache_context>& vector_cache,
-                                            replay_cache_metadata& cache_metadata,
-                                            std::map<std::string, ksp_setup_context>& ksp_context_cache)
-{
-  if(memory_limit_mb <= 0.0) return 0;
-  while(replay_cache_memory_mb(vector_cache, cache_metadata) > memory_limit_mb &&
-        (!matrix_cache.empty() || !vector_cache.empty())) {
-    bool evict_matrix = false;
-    std::string evict_key;
-    unsigned long oldest = 0;
-
-    for(const auto& item : cache_metadata.matrix_last_used) {
-      if(evict_key.empty() || item.second < oldest) {
-        evict_key = item.first;
-        oldest = item.second;
-        evict_matrix = true;
-      }
-    }
-    for(const auto& item : vector_cache) {
-      if(evict_key.empty() || item.second.last_used < oldest) {
-        evict_key = item.first;
-        oldest = item.second.last_used;
-        evict_matrix = false;
-      }
-    }
-    if(evict_key.empty()) break;
-
-    if(evict_matrix) {
-      for(auto iterator = ksp_context_cache.begin(); iterator != ksp_context_cache.end();) {
-        if(iterator->second.matrix_cache_key == evict_key) {
-          if(iterator->second.ksp) KSPTUNE_PETSC_CALL(KSPDestroy(&iterator->second.ksp));
-          iterator = ksp_context_cache.erase(iterator);
-        } else {
-          ++iterator;
-        }
-      }
-      auto matrix = matrix_cache.find(evict_key);
-      if(matrix != matrix_cache.end()) {
-        KSPTUNE_PETSC_CALL(MatDestroy(&matrix->second));
-        matrix_cache.erase(matrix);
-      }
-      cache_metadata.matrix_memory_mb.erase(evict_key);
-      cache_metadata.matrix_last_used.erase(evict_key);
-    } else {
-      auto vector = vector_cache.find(evict_key);
-      if(vector != vector_cache.end()) {
-        if(vector->second.vector) KSPTUNE_PETSC_CALL(VecDestroy(&vector->second.vector));
-        vector_cache.erase(vector);
-      }
-    }
-    ++cache_metadata.evictions;
-  }
-  return 0;
+  return ksptune::select_snapshot(snapshots, args.solve_target, args.snapshot_id);
 }
 
 PetscErrorCode run_replay_snapshots(const replay_args& args,
                                     const std::vector<snapshot>& available_snapshots,
-                                    std::map<std::string, Mat>& matrix_cache,
-                                    std::map<std::string, vector_cache_context>& vector_cache,
-                                    replay_cache_metadata& cache_metadata,
-                                    std::map<std::string, ksp_setup_context>& ksp_context_cache,
+                                    replay_cache& cache,
                                     PetscLogStage solve_log_stage,
                                     bool solve_mpi_logging_enabled)
 {
@@ -1959,6 +2447,8 @@ PetscErrorCode run_replay_snapshots(const replay_args& args,
   aggregate.repeat = args.repeat;
   aggregate.warmup = args.warmup;
   aggregate.snapshots = int(snapshots.size());
+  aggregate.use_initial_guess = args.use_initial_guess;
+  aggregate.soft_timeout_sec = args.soft_timeout_sec;
   aggregate.nullspace = nullspace_description(args);
   aggregate.nullspace_source = args.nullspace_mode == "from-metadata"
       ? "from-metadata"
@@ -1969,6 +2459,14 @@ PetscErrorCode run_replay_snapshots(const replay_args& args,
   aggregate.field_nullspace_block_size = args.field_nullspace >= 0
       ? args.field_nullspace_block_size
       : 0;
+  PetscEventPerfInfo solve_mpi_start_info;
+  read_solve_mpi_perf_info(
+      solve_log_stage,
+      solve_mpi_logging_enabled,
+      solve_mpi_start_info);
+  memory_tracker memory;
+  KSPTUNE_PETSC_CALL(memory.initialize(PETSC_COMM_WORLD));
+  KSPTUNE_PETSC_CALL(memory.sample(aggregate, "request_start"));
 
   std::vector<replay_snapshot_plan> plans(snapshots.size());
   std::map<std::string, int> matrix_cache_key_counts;
@@ -1990,15 +2488,14 @@ PetscErrorCode run_replay_snapshots(const replay_args& args,
         args,
         snapshots[index],
         plans[index],
-        matrix_cache,
-        vector_cache,
-        cache_metadata,
-        ksp_context_cache,
+        cache,
         solve_log_stage,
         solve_mpi_logging_enabled,
+        memory,
         aggregate,
         solve_times,
         iteration_counts));
+    if(aggregate.soft_timeout_triggered) break;
   }
 
   aggregate.solve_time_sec_total = std::accumulate(solve_times.begin(), solve_times.end(), 0.0);
@@ -2007,27 +2504,35 @@ PetscErrorCode run_replay_snapshots(const replay_args& args,
   aggregate.solve_time_sec_min = minimum_value(solve_times);
   aggregate.solve_time_sec_max = maximum_value(solve_times);
   aggregate.solve_time_sec_stddev = population_stddev(solve_times);
+  aggregate.solve_time_sec_sem = standard_error_of_mean(solve_times);
+  aggregate.solve_time_sec_relative_sem = aggregate.solve_time_sec_mean != 0.0
+      ? aggregate.solve_time_sec_sem / aggregate.solve_time_sec_mean
+      : 0.0;
   aggregate.solve_time_sec_range = value_range(solve_times);
   aggregate.solve_count = int(solve_times.size());
   aggregate.objective_time_sec_median = aggregate.solve_time_sec_median;
-  collect_solve_mpi_diagnostics(solve_log_stage, solve_mpi_logging_enabled, aggregate);
+  collect_solve_mpi_diagnostics(
+      solve_log_stage,
+      solve_mpi_logging_enabled,
+      solve_mpi_start_info,
+      aggregate);
   aggregate.iterations_median = median(iteration_counts);
   aggregate.iterations_total = std::accumulate(iteration_counts.begin(), iteration_counts.end(), 0.0);
 
-  std::vector<double> initial_residuals;
-  std::vector<double> initial_relatives;
-  std::vector<double> final_residuals;
-  std::vector<double> final_relatives;
-  for(const step_result& step : aggregate.steps) {
-    initial_residuals.push_back(step.initial_true_residual_norm);
-    initial_relatives.push_back(step.initial_true_relative_residual);
-    final_residuals.push_back(step.final_true_residual_norm);
-    final_relatives.push_back(step.final_true_relative_residual);
-  }
-  aggregate.initial_true_residual_norm_mean = mean(initial_residuals);
-  aggregate.initial_true_relative_residual_mean = mean(initial_relatives);
-  aggregate.final_true_residual_norm_mean = mean(final_residuals);
-  aggregate.final_true_relative_residual_mean = mean(final_relatives);
+  const auto step_mean = [&](double step_result::*metric) {
+    double total = 0.0;
+    for(const auto& step : aggregate.steps) total += step.*metric;
+    return aggregate.steps.empty() ? 0.0 : total / aggregate.steps.size();
+  };
+  aggregate.initial_true_residual_norm_mean = step_mean(&step_result::initial_true_residual_norm);
+  aggregate.initial_true_relative_residual_mean = step_mean(&step_result::initial_true_relative_residual);
+  aggregate.final_true_residual_norm_mean = step_mean(&step_result::final_true_residual_norm);
+  aggregate.final_true_relative_residual_mean = step_mean(&step_result::final_true_relative_residual);
+  aggregate.initial_ksp_residual_norm_mean = step_mean(&step_result::initial_ksp_residual_norm);
+  aggregate.final_ksp_residual_norm_mean = step_mean(&step_result::final_ksp_residual_norm);
+  aggregate.ksp_rtol_reference_norm_mean = step_mean(&step_result::ksp_rtol_reference_norm);
+  aggregate.ksp_convergence_threshold_norm_mean = step_mean(&step_result::ksp_convergence_threshold_norm);
+  aggregate.final_ksp_relative_residual_norm_mean = step_mean(&step_result::final_ksp_relative_residual_norm);
 
   KSPTUNE_PETSC_CALL(PetscTime(&replay_end));
   double total_wall_time_sec = double(replay_end - replay_start);
@@ -2039,18 +2544,19 @@ PetscErrorCode run_replay_snapshots(const replay_args& args,
       MPI_MAX,
       PETSC_COMM_WORLD);
   aggregate.total_wall_time_sec = total_wall_time_sec;
-  collect_memory_diagnostics(aggregate);
-  KSPTUNE_PETSC_CALL(evict_replay_cache_if_needed(
-      args.cache_memory_mb,
-      matrix_cache,
-      vector_cache,
-      cache_metadata,
-      ksp_context_cache));
-  aggregate.replay_cache_memory_mb = replay_cache_memory_mb(vector_cache, cache_metadata);
+  const int replay_cache_evictions_before = cache.evictions;
+  KSPTUNE_PETSC_CALL(cache.evict(args.cache_memory_mb));
+  if(args.replay_server) KSPTUNE_PETSC_CALL(cache.clear_ksps());
+  KSPTUNE_PETSC_CALL(memory.sample(aggregate, "request_end"));
+  summarize_request_memory(aggregate);
+  KSPTUNE_PETSC_CALL(memory.destroy());
+  aggregate.matrix_cache_memory_mb = cache.matrix_memory_mb();
+  aggregate.vector_cache_memory_mb = cache.vector_memory_mb();
+  aggregate.replay_cache_memory_mb = cache.memory_mb();
   aggregate.replay_cache_memory_limit_mb = args.cache_memory_mb;
-  aggregate.replay_cache_evictions = cache_metadata.evictions;
+  aggregate.replay_cache_evictions = cache.evictions - replay_cache_evictions_before;
 
-  write_json_result(aggregate, args.json_output_path);
+  KSPTUNE_PETSC_CALL(write_json_result(aggregate, args.json_output_path));
   return 0;
 }
 
@@ -2083,21 +2589,14 @@ PetscErrorCode run_replay(const replay_args& args)
     return PETSC_ERR_FILE_OPEN;
   }
 
-  std::map<std::string, Mat> matrix_cache;
-  std::map<std::string, vector_cache_context> vector_cache;
-  replay_cache_metadata cache_metadata;
-  std::map<std::string, ksp_setup_context> ksp_context_cache;
+  replay_cache cache;
   const PetscErrorCode ierr = run_replay_snapshots(
       args,
       snapshots,
-      matrix_cache,
-      vector_cache,
-      cache_metadata,
-      ksp_context_cache,
+      cache,
       solve_log_stage,
       solve_mpi_logging_enabled);
-  const PetscErrorCode destroy_ierr =
-      destroy_replay_caches(matrix_cache, vector_cache, cache_metadata, ksp_context_cache);
+  const PetscErrorCode destroy_ierr = cache.clear();
   return ierr ? ierr : destroy_ierr;
 }
 
@@ -2130,16 +2629,14 @@ PetscErrorCode run_replay_server(const replay_args& base_args)
         solve_log_stage >= 0;
   }
 
-  std::map<std::string, Mat> matrix_cache;
-  std::map<std::string, vector_cache_context> vector_cache;
-  replay_cache_metadata cache_metadata;
-  std::map<std::string, ksp_setup_context> ksp_context_cache;
+  replay_cache cache;
 
   std::string line;
   while(broadcast_server_line(line)) {
     replay_server_request request;
-    if(!parse_replay_server_request(line, request)) {
-      write_server_response("", int(PETSC_ERR_ARG_WRONG), "invalid replay server request");
+    std::string request_error;
+    if(!parse_replay_server_request(line, request, request_error)) {
+      write_server_response(request.id, int(PETSC_ERR_ARG_WRONG), request_error);
       continue;
     }
     if(request.command == "shutdown") {
@@ -2153,7 +2650,15 @@ PetscErrorCode run_replay_server(const replay_args& base_args)
     request_args.petsc_options_key = petsc_options_cache_key(request.petsc_options);
     if(request.repeat >= 1) request_args.repeat = request.repeat;
     if(request.warmup >= 0) request_args.warmup = request.warmup;
-    if(request.solve_target != -2) request_args.solve_target = request.solve_target;
+    if(request.solve_target != -2) {
+      request_args.solve_target = request.solve_target;
+      request_args.snapshot_id.clear();
+    }
+    if(!request.snapshot_id.empty()) {
+      request_args.snapshot_id = request.snapshot_id;
+      if(request.solve_target == -2) request_args.solve_target = -1;
+    }
+    if(request.soft_timeout_sec >= 0.0) request_args.soft_timeout_sec = request.soft_timeout_sec;
 
     std::vector<std::string> set_keys;
     PetscErrorCode ierr = set_request_petsc_options(request.petsc_options, set_keys);
@@ -2161,10 +2666,7 @@ PetscErrorCode run_replay_server(const replay_args& base_args)
       ierr = run_replay_snapshots(
           request_args,
           snapshots,
-          matrix_cache,
-          vector_cache,
-          cache_metadata,
-          ksp_context_cache,
+          cache,
           solve_log_stage,
           solve_mpi_logging_enabled);
     }
@@ -2173,13 +2675,21 @@ PetscErrorCode run_replay_server(const replay_args& base_args)
     if(ierr) {
       std::ostringstream reason;
       reason << "replay server request failed with PETSc error " << int(ierr);
+      const PetscErrorCode cleanup_ierr = cache.clear_ksps();
+      clear_hypre_errors();
+      if(cleanup_ierr) {
+        reason << "; replay server cleanup failed with PETSc error "
+               << int(cleanup_ierr);
+        write_server_response(request.id, int(cleanup_ierr), reason.str());
+        return cleanup_ierr;
+      }
       write_server_response(request.id, int(ierr), reason.str());
     } else {
       write_server_response(request.id, 0, "");
     }
   }
 
-  return destroy_replay_caches(matrix_cache, vector_cache, cache_metadata, ksp_context_cache);
+  return cache.clear();
 }
 
 }  // namespace
@@ -2190,7 +2700,11 @@ int main(int argc, char** argv)
   if(ierr) return int(ierr);
   const replay_args args = parse_args(argc, argv);
   clear_replay_options();
-  ierr = args.replay_server ? run_replay_server(args) : run_replay(args);
+  if(args.options_help) {
+    ierr = run_options_help();
+  } else {
+    ierr = args.replay_server ? run_replay_server(args) : run_replay(args);
+  }
   const PetscErrorCode finalize_ierr = PetscFinalize();
   return int(ierr ? ierr : finalize_ierr);
 }

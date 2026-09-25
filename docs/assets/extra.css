@@ -1,0 +1,39 @@
+.md-header__button.md-logo {
+  padding: 0.1rem 0.4rem;
+}
+
+.md-header__button.md-logo img {
+  height: 1.8rem;
+  width: auto;
+}
+
+.md-typeset .terminal-output {
+  background: #171717;
+  border-radius: 0.2rem;
+  color: #e5e5e5;
+}
+
+.md-typeset .terminal-output code {
+  background: transparent;
+  color: inherit;
+  display: block;
+  overflow-wrap: anywhere;
+  padding: 1rem;
+  white-space: pre-wrap;
+}
+
+.terminal-output .terminal-green {
+  color: #4ce04c;
+}
+
+.terminal-output .terminal-yellow {
+  color: #ffff55;
+}
+
+.terminal-output .terminal-cyan {
+  color: #55dddd;
+}
+
+.terminal-output .terminal-bold {
+  font-weight: 700;
+}

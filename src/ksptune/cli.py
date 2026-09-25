@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import argparse
-import os
-import shutil
+import shlex
 import sys
-import textwrap
+from datetime import datetime
+from dataclasses import MISSING, fields
 from pathlib import Path
 from typing import Any
 
@@ -19,662 +19,41 @@ from .parameter_search_spaces import (
     parameter_search_space_to_yaml,
 )
 from .petsc_options import petsc_options_to_text, render_petsc_options_from_solver_configuration
+from .petsc_help import (
+    normalize_petsc_help_options,
+    petsc_options_help_to_json,
+    query_petsc_options_help,
+)
 from .snapshot_analysis import analyze_snapshots
-from .tuning_runs import BAD_COST, resume_tuning, run_tuning
+from .tuning_runs import (
+    TuningSettings,
+    RESUME_OVERRIDE_FIELDS,
+    resolve_replay_binary,
+    resume_tuning,
+    run_tuning,
+)
 
-ANSI_STYLES = {
-    "bold": "\033[1m",
-    "red": "\033[31m",
-    "green": "\033[32m",
-    "yellow": "\033[33m",
-    "cyan": "\033[36m",
-    "reset": "\033[0m",
-}
+from .progress_output import (
+    color_enabled,
+    print_tune_progress as render_tune_progress,
+)
+from .trial_records import add_trial_metrics
 
 
 def print_yaml(data: Any) -> None:
     print(yaml.safe_dump(data, sort_keys=False).rstrip())
 
 
-def style(text: Any, *styles: str, color_enabled: bool = False) -> str:
-    plain_text = str(text)
-    if not color_enabled or not styles:
-        return plain_text
-    prefix = "".join(ANSI_STYLES[style] for style in styles)
-    return f"{prefix}{plain_text}{ANSI_STYLES['reset']}"
-
-
-def color_enabled(color: str) -> bool:
-    if color == "always":
-        return True
-    if color == "never":
-        return False
-    if os.environ.get("NO_COLOR") is not None:
-        return False
-    return sys.stdout.isatty()
-
-
-def format_sec(value: Any) -> str:
-    if value is None:
-        return "n/a"
-    return f"{float(value):.3f}s"
-
-
-def format_mb(value: Any) -> str:
-    if value is None:
-        return "n/a"
-    numeric_value = float(value)
-    if abs(numeric_value) >= 1024:
-        return f"{numeric_value / 1024.0:.1f}GB"
-    return f"{numeric_value:.1f}MB"
-
-
-def format_bytes(value: Any) -> str:
-    if value is None:
-        return "n/a"
-    numeric_value = float(value)
-    units = ["B", "KB", "MB", "GB", "TB"]
-    unit_index = 0
-    while abs(numeric_value) >= 1024.0 and unit_index + 1 < len(units):
-        numeric_value /= 1024.0
-        unit_index += 1
-    if unit_index == 0:
-        return f"{numeric_value:.0f}{units[unit_index]}"
-    return f"{numeric_value:.1f}{units[unit_index]}"
-
-
-def format_float(value: Any) -> str:
-    if value is None:
-        return "n/a"
-    numeric_value = float(value)
-    if abs(numeric_value) >= 1000 or (numeric_value != 0.0 and abs(numeric_value) < 0.001):
-        return f"{numeric_value:.3e}"
-    return f"{numeric_value:.6g}"
-
-
-def format_objective_value_text(event: dict[str, Any], value_key: str) -> str:
-    value = event.get(value_key)
-    if value is None:
-        return "n/a"
-    numeric_value = float(value)
-    if numeric_value >= BAD_COST * 0.1:
-        return "bad-cost"
-    text = format_float(numeric_value)
-    objective_name = str(event.get("objective_name") or "")
-    if "_sec" in objective_name:
-        text = f"{text}s"
-    return text
-
-
-def format_objective(event: dict[str, Any], *, color_enabled: bool = False) -> str:
-    value = event.get("objective_value")
-    if value is None:
-        return "n/a"
-    numeric_value = float(value)
-    if numeric_value >= BAD_COST * 0.1:
-        return style("bad-cost", "bold", "red", color_enabled=color_enabled)
-    text = format_objective_value_text(event, "objective_value")
-    if event.get("is_new_best_so_far"):
-        return style(text, "bold", "green", color_enabled=color_enabled)
-    if event.get("best_objective_value_so_far") is not None:
-        return style(text, "bold", "yellow", color_enabled=color_enabled)
-    return style(text, "bold", "green", color_enabled=color_enabled)
-
-
-def format_best_objective_so_far(event: dict[str, Any], *, color_enabled: bool = False) -> str:
-    value = event.get("best_objective_value_so_far")
-    if value is None:
-        return "n/a"
-    text = format_objective_value_text(event, "best_objective_value_so_far")
-    return style(text, "bold", "cyan", color_enabled=color_enabled)
-
-
-def format_trial_index(trial_number: Any, trial_count: Any) -> str:
-    if trial_number is None:
-        return "?/?"
-    if trial_count is None:
-        return f"{int(trial_number):03d}/..."
-    width = max(3, len(str(int(trial_count))))
-    return f"{int(trial_number):0{width}d}/{int(trial_count):0{width}d}"
-
-
-def short_text(value: Any, max_length: int = 120) -> str:
-    text = str(value)
-    if len(text) <= max_length:
-        return text
-    return text[: max_length - 3] + "..."
-
-
-def display_path(value: Any) -> str:
-    if value is None:
-        return "n/a"
-    path = Path(str(value))
-    text = str(path)
-    if not path.is_absolute():
-        return text
-    try:
-        relative_path = path.resolve().relative_to(Path.cwd().resolve())
-    except ValueError:
-        return text
-    relative_text = str(relative_path)
-    return relative_text if len(relative_text) < len(text) else text
-
-
-def terminal_width() -> int:
-    return shutil.get_terminal_size(fallback=(100, 24)).columns
-
-
-def wrapped_lines(
-    text: str,
-    *,
-    initial_indent: str = "",
-    subsequent_indent: str = "",
-) -> list[str]:
-    return textwrap.wrap(
-        text,
-        width=terminal_width(),
-        initial_indent=initial_indent,
-        subsequent_indent=subsequent_indent,
-        break_long_words=False,
-        break_on_hyphens=False,
-    ) or [initial_indent.rstrip()]
-
-
-def wrapped_labeled_lines(
-    label: str,
-    value: Any,
-    *,
-    indent: str = "  ",
-    valuestyles: tuple[str, ...] = (),
-    color_enabled: bool = False,
-) -> list[str]:
-    prefix = f"{indent}{label}: "
-    lines = wrapped_lines(str(value), initial_indent=prefix, subsequent_indent=" " * len(prefix))
-    if not valuestyles or not color_enabled:
-        return lines
-    styled_lines: list[str] = []
-    value_start = len(prefix)
-    for line in lines:
-        if len(line) <= value_start:
-            styled_lines.append(line)
-        else:
-            styled_lines.append(
-                line[:value_start]
-                + style(line[value_start:], *valuestyles, color_enabled=color_enabled)
-            )
-    return styled_lines
-
-
-def print_block(lines: list[str], *, leading_blank: bool = True) -> None:
-    if leading_blank:
-        print()
-    for line in lines:
-        print(line)
-
-
-def petsc_option_groups(options_text: str) -> list[str]:
-    tokens = options_text.split()
-    groups: list[str] = []
-    index = 0
-    while index < len(tokens):
-        token = tokens[index]
-        next_token = tokens[index + 1] if index + 1 < len(tokens) else None
-        if token.startswith("-") and next_token is not None and not next_token.startswith("-"):
-            groups.append(f"{token} {next_token}")
-            index += 2
-        else:
-            groups.append(token)
-            index += 1
-    return groups
-
-
-def wrapped_petsc_options_lines(options_text: str, *, indent: str = "    ") -> list[str]:
-    groups = petsc_option_groups(options_text)
-    if not groups:
-        return [f"{indent}n/a"]
-
-    lines: list[str] = []
-    current = ""
-    width = terminal_width()
-    for group in groups:
-        candidate = group if current == "" else f"{current} {group}"
-        if current and len(indent) + len(candidate) > width:
-            lines.append(f"{indent}{current}")
-            current = group
-        else:
-            current = candidate
-
-    if current:
-        lines.append(f"{indent}{current}")
-    return lines
-
-
-def format_solver_configuration(event: dict[str, Any]) -> str:
-    solver_configuration = event.get("solver_configuration") or {}
-    known_parameters = [
-        ("ksp_type", "ksp"),
-        ("pc_type", "pc"),
-        ("ksp_gmres_restart", "restart"),
-        ("pc_asm_overlap", "overlap"),
-        ("sub_pc_type", "sub_pc"),
-        ("sub_pc_factor_levels", "levels"),
-        ("ksp_pc_side", "side"),
-        ("ksp_max_it", "max_it"),
-        ("pc_hypre_type", "hypre"),
-        ("pc_hypre_boomeramg_cycle_type", "bamg_cycle"),
-        ("pc_hypre_boomeramg_strong_threshold", "bamg_strong"),
-    ]
-    parts = [
-        f"{label}={format_float(value) if isinstance(value, float) else value}"
-        for key, label in known_parameters
-        if (value := solver_configuration.get(key)) is not None
-    ]
-    known_keys = {key for key, _label in known_parameters}
-    parts.extend(
-        f"{key}={format_float(value) if isinstance(value, float) else value}"
-        for key, value in sorted(solver_configuration.items())
-        if key not in known_keys
-    )
-    return " ".join(str(part) for part in parts) if parts else "n/a"
-
-
-def should_print_replay_command(event: dict[str, Any]) -> bool:
-    if not event.get("failure_reason") or not event.get("replay_command_text"):
-        return False
-    failure_reason = str(event.get("failure_reason") or "")
-    if failure_reason.startswith("replay command timed out"):
-        return False
-    returncode = event.get("returncode")
-    if returncode not in (None, 0):
-        return True
-    return failure_reason.startswith("replay command returned ")
-
-
-def format_replay_command_line(command_text: Any, *, color_enabled: bool = False) -> str:
-    single_line_command = str(command_text).replace("\r", " ").replace("\n", " ")
-    return "  reproduce: " + style(single_line_command, "cyan", color_enabled=color_enabled)
-
-
-def format_solve_runtime(event: dict[str, Any]) -> str:
-    solve_count = event.get("solve_count")
-    try:
-        solve_count_int = int(solve_count) if solve_count is not None else None
-    except (TypeError, ValueError):
-        solve_count_int = None
-
-    solve_total = event.get("solve_time_sec_total")
-    solve_mean = event.get("solve_time_sec_mean")
-    solve_median = event.get("solve_time_sec_median")
-    solve_min = event.get("solve_time_sec_min")
-    solve_max = event.get("solve_time_sec_max")
-    if solve_count_int is not None and solve_count_int > 1:
-        if solve_total is None and solve_mean is not None:
-            solve_total = float(solve_mean) * solve_count_int
-        if solve_total is not None:
-            if solve_mean is None:
-                solve_mean = float(solve_total) / solve_count_int
-            details = [f"samples={solve_count_int}", f"avg={format_sec(solve_mean)}"]
-            if solve_min is not None and solve_max is not None:
-                details.append(f"min-max={format_sec(solve_min)}-{format_sec(solve_max)}")
-            return f"{format_sec(solve_total)} ({', '.join(details)})"
-
-    return format_sec(solve_median)
-
-
-def format_setup_runtime(event: dict[str, Any]) -> str:
-    setup_time = event.get("solver_setup_time_sec")
-    actual_setup_time = event.get("solver_setup_time_sec_actual")
-    cache_hits = event.get("ksp_setup_cache_hits")
-    cache_misses = event.get("ksp_setup_cache_misses")
-    try:
-        cache_hits_int = int(cache_hits) if cache_hits is not None else 0
-        cache_misses_int = int(cache_misses) if cache_misses is not None else 0
-    except (TypeError, ValueError):
-        cache_hits_int = 0
-        cache_misses_int = 0
-
-    try:
-        setup_time_differs = (
-            setup_time is not None
-            and actual_setup_time is not None
-            and float(setup_time) != float(actual_setup_time)
-        )
-    except (TypeError, ValueError):
-        setup_time_differs = False
-
-    if (
-        setup_time is not None
-        and actual_setup_time is not None
-        and (cache_hits_int > 0 or setup_time_differs)
-    ):
-        return (
-            f"{format_sec(setup_time)} logical "
-            f"(actual={format_sec(actual_setup_time)}, "
-            f"ksp-cache={cache_hits_int}/{cache_misses_int})"
-        )
-    return format_sec(setup_time)
-
-
-def format_iterations(event: dict[str, Any]) -> str:
-    iterations_total = event.get("iterations_total")
-    if iterations_total is None:
-        return "n/a"
-
-    try:
-        solve_count = int(event["solve_count"]) if event.get("solve_count") is not None else None
-    except (TypeError, ValueError):
-        solve_count = None
-
-    details = []
-    if solve_count is not None and solve_count > 0:
-        details.append(f"samples={solve_count}")
-        details.append(f"mean={format_float(float(iterations_total) / solve_count)}")
-
-    text = format_float(iterations_total)
-    return f"{text} ({', '.join(details)})" if details else text
-
-
-def format_memory_summary(event: dict[str, Any]) -> str:
-    memory_total = event.get("peak_memory_mb_sum")
-    memory_mean_per_rank = event.get("peak_memory_mb_mean_per_rank")
-    rank_count = event.get("peak_memory_rank_count")
-    try:
-        rank_count_int = int(rank_count) if rank_count is not None else None
-    except (TypeError, ValueError):
-        rank_count_int = None
-
-    if memory_total is None and memory_mean_per_rank is not None and rank_count_int:
-        memory_total = float(memory_mean_per_rank) * rank_count_int
-
-    if memory_total is not None:
-        details = []
-        if rank_count_int:
-            details.append(f"ranks={rank_count_int}")
-        if memory_mean_per_rank is not None:
-            details.append(f"avg/rank={format_mb(memory_mean_per_rank)}")
-        suffix = f" ({', '.join(details)})" if details else ""
-        return f"total={format_mb(memory_total)}{suffix}"
-
-    if memory_mean_per_rank is not None:
-        return f"avg/rank={format_mb(memory_mean_per_rank)}"
-    return "n/a"
-
-
-def format_mpi_summary(event: dict[str, Any]) -> str | None:
-    message_count = event.get("solve_mpi_message_count")
-    message_bytes = event.get("solve_mpi_message_bytes")
-    reduction_count = event.get("solve_mpi_reduction_count")
-    if message_count is None and message_bytes is None and reduction_count is None:
-        return None
-
-    parts = ["solve"]
-    if message_count is not None:
-        parts.append(f"msgs={format_float(message_count)}")
-    if message_bytes is not None:
-        parts.append(f"bytes={format_bytes(message_bytes)}")
-    if reduction_count is not None:
-        parts.append(f"reductions={format_float(reduction_count)}")
-    mean_message_bytes = event.get("solve_mpi_message_bytes_mean")
-    if mean_message_bytes is not None and float(message_count or 0) > 0.0:
-        parts.append(f"avg={format_bytes(mean_message_bytes)}/msg")
-    return " ".join(parts)
-
-
-def format_nullspace_configuration(configuration: dict[str, Any] | None) -> str:
-    if not configuration or configuration.get("mode") == "none":
-        return "none"
-    if configuration.get("mode") == "constant":
-        return "constant"
-    if configuration.get("mode") == "field":
-        label = configuration.get("label", "field")
-        return (
-            f"{label} "
-            f"(field={configuration.get('field_index')}, "
-            f"block_size={configuration.get('block_size')})"
-        )
-    return str(configuration.get("label") or configuration)
-
-
-def format_status(status: str, *, color_enabled: bool = False) -> str:
-    if status in {"ok", "completed"}:
-        return style(status, "green", color_enabled=color_enabled)
-    if status in {"failed", "error"}:
-        return style(status, "red", color_enabled=color_enabled)
-    if status in {"stopped", "dry-run"}:
-        return style(status, "yellow", color_enabled=color_enabled)
-    return status
-
-
-def format_configuration_tag(tag: Any, *, color_enabled: bool = False) -> str:
-    return style(f"[{tag}]", "cyan", color_enabled=color_enabled)
-
-
-def format_trial_heading(
-    event: dict[str, Any],
-    status: str,
-    *,
-    color_enabled: bool = False,
-) -> str:
-    trial_index = format_trial_index(event.get("trial_number"), event.get("trial_count"))
-    smac_configuration_tag = event.get("smac_configuration_tag")
-    heading = f"trial {trial_index}"
-    if smac_configuration_tag:
-        heading += f" {format_configuration_tag(smac_configuration_tag, color_enabled=color_enabled)}"
-    return (
-        f"{heading} {format_status(status, color_enabled=color_enabled)}  "
-        f"objective: {format_objective(event, color_enabled=color_enabled)}  "
-        f"(best: {format_best_objective_so_far(event, color_enabled=color_enabled)})"
-    )
-
-
-def finish_block_lines(event: dict[str, Any], *, color_enabled: bool = False) -> list[str]:
-    status = str(event["status"])
-    lines = [f"finished: {format_status(status, color_enabled=color_enabled)}"]
-    summary = event.get("summary") or {}
-    best_trial = summary.get("best_trial")
-    if best_trial:
-        best_event = {
-            "objective_value": best_trial.get("objective_value"),
-            "objective_name": summary.get("objective_name"),
-            "solver_configuration": best_trial.get("solver_configuration"),
-        }
-        best_line = f"  best: trial {best_trial.get('trial_number')}"
-        if best_trial.get("smac_configuration_tag"):
-            best_line += (
-                f" {format_configuration_tag(best_trial['smac_configuration_tag'], color_enabled=color_enabled)}"
-            )
-        best_line += f"  objective={format_objective(best_event, color_enabled=color_enabled)}"
-        lines.append(best_line)
-        lines.extend(
-            wrapped_labeled_lines(
-                "solver",
-                format_solver_configuration(best_event),
-                indent="  ",
-            )
-        )
-        lines.append("  PETSc options:")
-        lines.extend(wrapped_petsc_options_lines(str(best_trial.get("petsc_options_text") or "")))
-    else:
-        lines.append("  best: no successful trial yet")
-
-    lines.append("  files:")
-    lines.extend(
-        wrapped_labeled_lines(
-            "summary",
-            display_path(event["tuning_summary_path"]),
-            indent="    ",
-            valuestyles=("cyan",),
-            color_enabled=color_enabled,
-        )
-    )
-    lines.extend(
-        wrapped_labeled_lines(
-            "trials",
-            display_path(event["trial_csv_path"]),
-            indent="    ",
-            valuestyles=("cyan",),
-            color_enabled=color_enabled,
-        )
-    )
-    lines.extend(
-        wrapped_labeled_lines(
-            "rankings",
-            display_path(event["ranking_csv_path"]),
-            indent="    ",
-            valuestyles=("cyan",),
-            color_enabled=color_enabled,
-        )
-    )
-    if best_trial:
-        lines.extend(
-            wrapped_labeled_lines(
-                "best options",
-                display_path(event["best_petsc_options_path"]),
-                indent="    ",
-                valuestyles=("cyan",),
-                color_enabled=color_enabled,
-            )
-        )
-    return lines
+def current_progress_timestamp() -> str:
+    return datetime.now().strftime("%H:%M:%S")
 
 
 def print_tune_progress(event: dict[str, Any], *, color_enabled: bool = False) -> None:
-    event_name = event.get("event")
-    if event_name == "run_started":
-        workers = event.get("workers", 1)
-        lines = [style("KSPTune tuning run", "bold", color_enabled=color_enabled)]
-        lines.extend(
-            wrapped_labeled_lines(
-                "snapshots",
-                display_path(event["snapshot_directory_path"]),
-                valuestyles=("cyan",),
-                color_enabled=color_enabled,
-            )
-        )
-        lines.extend(wrapped_labeled_lines("search space", event["parameter_search_space_name"]))
-        lines.extend(
-            wrapped_labeled_lines(
-                "output",
-                display_path(event["output_directory"]),
-                valuestyles=("cyan",),
-                color_enabled=color_enabled,
-            )
-        )
-        if event.get("run_until_stopped"):
-            lines.append(
-                "  mode: "
-                + style("until stopped", "yellow", color_enabled=color_enabled)
-                + f"  workers={workers}  repeat={event['repeat']}  warmup={event['warmup']}"
-            )
-            lines.append(
-                "  stop: "
-                + style("Ctrl+C", "yellow", color_enabled=color_enabled)
-                + " writes the current summary and prints the best configuration"
-            )
-        else:
-            lines.append(
-                f"  mode: {event['trials']} trials  workers={workers}  "
-                f"repeat={event['repeat']}  warmup={event['warmup']}"
-            )
-        if "sobol_initial_design_configurations" in event:
-            initial_design_parts = []
-            if event.get("use_default_solver_configuration"):
-                initial_design_parts.append("default")
-            additional_count = event.get("additionalinitial_solver_configuration_count", 0)
-            if additional_count:
-                initial_design_parts.append(f"{additional_count} seeded")
-            initial_design_parts.append(
-                f"{event.get('sobol_initial_design_configurations', 0)} sobol"
-            )
-            lines.append(
-                "  initial design: "
-                + " + ".join(initial_design_parts)
-                + f"  tunable_parameters={event.get('tunable_parameter_count', 'n/a')}"
-            )
-        if event.get("replay_binary"):
-            replay_text = display_path(event["replay_binary"])
-            if event.get("replay_binary_auto_detected"):
-                replay_text += " (auto)"
-            lines.extend(
-                wrapped_labeled_lines(
-                    "replay",
-                    replay_text,
-                    valuestyles=("cyan",),
-                    color_enabled=color_enabled,
-                )
-            )
-            nullspace_text = format_nullspace_configuration(event.get("nullspace_configuration"))
-            if nullspace_text != "none":
-                lines.extend(wrapped_labeled_lines("nullspace", nullspace_text))
-            if not event.get("dry_run"):
-                lines.append("  note: SMAC config IDs match tags in trial headings")
-        else:
-            lines.append("  replay: dry-run")
-        print_block(lines, leading_blank=False)
-        return
-
-    if event_name == "trial_finished":
-        wall_time = format_sec(event.get("total_wall_time_sec"))
-        true_residual = format_float(event.get("final_true_residual_norm_mean"))
-        true_relative_residual = format_float(event.get("final_true_relative_residual_mean"))
-        solver_configuration = format_solver_configuration(event)
-        failure_reason = event.get("failure_reason")
-        lines = [
-            format_trial_heading(
-                event,
-                "failed" if failure_reason else "ok",
-                color_enabled=color_enabled,
-            )
-        ]
-        lines.extend(wrapped_labeled_lines("solver", solver_configuration))
-        if failure_reason:
-            reason = short_text(failure_reason)
-            lines.append(
-                f"  runtime: subprocess={format_sec(event.get('subprocess_wall_time_sec'))}"
-            )
-            lines.extend(
-                wrapped_labeled_lines(
-                    "reason",
-                    reason,
-                    valuestyles=("red",),
-                    color_enabled=color_enabled,
-                )
-            )
-            if should_print_replay_command(event):
-                lines.append(
-                    format_replay_command_line(
-                        event["replay_command_text"],
-                        color_enabled=color_enabled,
-                    )
-                )
-        else:
-            setup_time = format_setup_runtime(event)
-            solve_time = format_solve_runtime(event)
-            lines.append(f"  runtime: solve={solve_time}  setup={setup_time}  wall={wall_time}")
-            lines.append(f"  memory: {format_memory_summary(event)}")
-            mpi_summary = format_mpi_summary(event)
-            if mpi_summary is not None:
-                lines.append(f"  mpi: {mpi_summary}")
-            lines.append(
-                f"  diagnostics: iters={format_iterations(event)}  "
-                f"true_res={true_residual}  true_rel_res={true_relative_residual}"
-            )
-        print_block(lines)
-        return
-
-    if event_name == "run_stopping":
-        print_block(
-            [
-                "stopping: "
-                + style("Ctrl+C", "yellow", color_enabled=color_enabled)
-                + f" received after {event['trial_count']} completed trials",
-                "  writing summary...",
-            ]
-        )
-        return
-
-    if event_name == "run_finished":
-        print_block(finish_block_lines(event, color_enabled=color_enabled))
+    render_tune_progress(
+        add_trial_metrics(event),
+        color_enabled=color_enabled,
+        timestamp=current_progress_timestamp(),
+    )
 
 
 def cmd_parameter_search_spaces_list(args: argparse.Namespace) -> int:  # noqa: ARG001
@@ -701,34 +80,16 @@ def cmd_parameter_search_spaces_validate(args: argparse.Namespace) -> int:
 
 
 def cmd_tune(args: argparse.Namespace) -> int:
-    parameter_search_space = load_parameter_search_space(args.parameter_search_space, seed=args.seed)
+    parameter_search_space = load_parameter_search_space(
+        args.parameter_search_space, seed=args.seed
+    )
     use_color = False if args.quiet else color_enabled(args.color)
-    progress_callback = None if args.quiet else lambda event: print_tune_progress(event, color_enabled=use_color)
-    run_until_stopped = args.run_until_stopped or args.trials is None
+    progress_callback = (
+        None if args.quiet else lambda event: print_tune_progress(event, color_enabled=use_color)
+    )
     result = run_tuning(
-        snapshot_directory=args.snapshot_directory,
+        TuningSettings(**{setting.name: getattr(args, setting.name) for setting in fields(TuningSettings)}),
         parameter_search_space=parameter_search_space,
-        output_directory=args.output_directory,
-        replay_binary=args.replay_binary,
-        mpiexec=args.mpiexec,
-        mpiexec_args=args.mpiexec_arg,
-        mpi_processes=args.np,
-        threads_per_rank=args.threads_per_rank,
-        workers=args.workers,
-        trials=args.trials,
-        repeat=args.repeat,
-        warmup=args.warmup,
-        timeout_sec=args.timeout_sec,
-        objective_name=args.objective,
-        seed=args.seed,
-        dry_run=args.dry_run,
-        run_until_stopped=run_until_stopped,
-        nullspace=args.nullspace,
-        nullspace_actions=args.nullspace_actions,
-        deduplicate_matrices=not args.no_deduplicate_matrices,
-        reuse_ksp_setup=not args.no_reuse_ksp_setup,
-        replay_cache_memory_mb=args.replay_cache_memory_mb,
-        force_restart=args.force_restart,
         progress_callback=progress_callback,
     )
     if args.quiet:
@@ -738,13 +99,12 @@ def cmd_tune(args: argparse.Namespace) -> int:
 
 def cmd_resume(args: argparse.Namespace) -> int:
     use_color = False if args.quiet else color_enabled(args.color)
-    progress_callback = None if args.quiet else lambda event: print_tune_progress(event, color_enabled=use_color)
+    progress_callback = (
+        None if args.quiet else lambda event: print_tune_progress(event, color_enabled=use_color)
+    )
     result = resume_tuning(
         args.tuning_run,
-        trials=args.trials,
-        run_until_stopped=args.run_until_stopped,
-        workers=args.workers,
-        timeout_sec=args.timeout_sec,
+        overrides={name: getattr(args, name) for name in RESUME_OVERRIDE_FIELDS},
         progress_callback=progress_callback,
     )
     if args.quiet:
@@ -761,13 +121,13 @@ def cmd_analyze_snapshots(args: argparse.Namespace) -> int:
         and args.snapshot_directory_argument is not None
         and Path(args.snapshot_directory) != Path(args.snapshot_directory_argument)
     ):
-        raise ValueError("pass the snapshot directory either positionally or with --snapshot-directory")
+        raise ValueError(
+            "pass the snapshot directory either positionally or with --snapshot-directory"
+        )
 
     output_path = (
         args.output
-        or Path(snapshot_directory)
-        / "ksptune_snapshot_analysis"
-        / "snapshot_analysis_summary.yaml"
+        or Path(snapshot_directory) / "ksptune_snapshot_analysis" / "snapshot_analysis_summary.yaml"
     )
     result = analyze_snapshots(
         snapshot_directory,
@@ -778,6 +138,7 @@ def cmd_analyze_snapshots(args: argparse.Namespace) -> int:
         threads_per_rank=args.threads_per_rank,
         nullspace=args.nullspace,
         solve_index=args.solve_index,
+        snapshot_id=args.snapshot_id,
         rhs_compatibility_tolerance=args.rhs_compatibility_tolerance,
         nullspace_residual_tolerance=args.nullspace_residual_tolerance,
         metadata_only=args.metadata_only,
@@ -795,9 +156,7 @@ def cmd_analyze_parameter_importance(args: argparse.Namespace) -> int:
 
 def cmd_export_petsc_options(args: argparse.Namespace) -> int:
     tuning_run_directory = Path(args.tuning_run)
-    configspace_path = tuning_run_directory / "configspace.yaml"
-    if not configspace_path.exists():
-        configspace_path = tuning_run_directory / "parameter_search_space.yaml"
+    configspace_path = tuning_run_directory / "configspace.json"
     parameter_search_space = load_parameter_search_space(configspace_path)
     solver_configuration = yaml.safe_load(
         (tuning_run_directory / "best_solver_configuration.yaml").read_text(encoding="utf-8")
@@ -807,6 +166,60 @@ def cmd_export_petsc_options(args: argparse.Namespace) -> int:
         solver_configuration,
     )
     print(petsc_options_to_text(options))
+    return 0
+
+
+def cmd_petsc_options(args: argparse.Namespace) -> int:
+    replay_binary, replay_binary_auto_detected = resolve_replay_binary(
+        args.replay_binary,
+        dry_run=False,
+    )
+    extra_petsc_options = list(args.petsc_options or [])
+    if extra_petsc_options and extra_petsc_options[0] == "--":
+        extra_petsc_options = extra_petsc_options[1:]
+    petsc_options, notes = normalize_petsc_help_options(
+        ksp_type=args.ksp_type,
+        pc_type=args.pc_type,
+        pc_hypre_type=args.pc_hypre_type,
+        extra_petsc_options=extra_petsc_options,
+    )
+    result = query_petsc_options_help(
+        replay_binary=replay_binary,
+        petsc_options=petsc_options,
+        mpiexec=args.mpiexec,
+        mpiexec_args=args.mpiexec_arg,
+        mpi_processes=args.np,
+        filters=args.filter,
+        raw=args.raw,
+        timeout_sec=args.timeout_sec,
+    )
+    if args.json:
+        print(petsc_options_help_to_json(result))
+        return int(result["returncode"])
+
+    print("PETSc options help")
+    replay_label = str(replay_binary)
+    if replay_binary_auto_detected:
+        replay_label += " (auto)"
+    print(f"  replay: {replay_label}")
+    print(f"  command: {shlex.join(str(part) for part in result['command'])}")
+    for note in notes:
+        print(f"  note: {note}")
+    if not args.raw and result["filters"]:
+        print(f"  filters: {' '.join(result['filters'])}")
+    print()
+
+    lines = result["raw_output"].splitlines() if args.raw else result["filtered_lines"]
+    for line in lines:
+        print(line)
+    if not lines:
+        print("No matching PETSc option lines found. Use --raw to inspect full PETSc -help output.")
+    if result["returncode"] != 0:
+        if not args.raw and result["raw_output"].strip():
+            print()
+            print("Command failed; raw output:")
+            print(result["raw_output"].rstrip())
+        return int(result["returncode"])
     return 0
 
 
@@ -837,40 +250,52 @@ def build_parser() -> argparse.ArgumentParser:
     tune.add_argument("--parameter-search-space", required=True)
     tune.add_argument("--output-directory", required=True)
     tune.add_argument("--replay-binary")
-    tune.add_argument("--mpiexec", default="mpiexec")
+    tune.add_argument("--mpiexec")
     tune.add_argument(
-        "--mpiexec-arg",
+        "--mpiexec-arg", dest="mpiexec_args",
         action="append",
-        default=[],
         help=(
             "Additional argument passed to the MPI launcher. Repeat for multiple arguments. "
             "Use --mpiexec-arg=--flag when the launcher argument starts with '-'."
         ),
     )
-    tune.add_argument("--np", type=int, default=1)
-    tune.add_argument("--threads-per-rank", type=int, default=1)
+    tune.add_argument("--np", dest="mpi_processes", type=int)
+    tune.add_argument("--threads-per-rank", type=int)
     tune.add_argument(
         "--workers",
         type=int,
-        default=1,
         help="Number of parallel SMAC workers. Each worker may launch --np MPI ranks.",
     )
     tune.add_argument(
         "--trials",
         type=int,
-        default=None,
         help="Run a fixed number of trials. Omit to run until stopped with Ctrl+C.",
     )
-    tune.add_argument("--repeat", type=int, default=1)
-    tune.add_argument("--warmup", type=int, default=0)
-    tune.add_argument("--timeout-sec", type=float)
-    tune.add_argument("--objective", default="solve_time_sec_mean")
+    tune.add_argument("--repeat", type=int)
+    tune.add_argument("--warmup", type=int)
+    tune.add_argument(
+        "--soft-timeout-sec",
+        type=float,
+        help="Cumulative KSPSolve time budget per trial. A soft timeout keeps the replay server alive.",
+    )
+    tune.add_argument(
+        "--hard-timeout-sec",
+        type=float,
+        help="Python-side safety timeout. A hard timeout kills and restarts the replay server.",
+    )
+    tune.add_argument(
+        "--replay-startup-timeout-sec",
+        type=float,
+        help=(
+            "Timeout for the first request handled by a newly started replay server. "
+            "Use this for large first matrix loads; later trials still use --hard-timeout-sec."
+        ),
+    )
+    tune.add_argument("--objective", dest="objective_name")
     tune.add_argument(
         "--nullspace",
-        default="from-metadata",
         help=(
-            "Replay nullspace: from-metadata, none, constant, or "
-            "field:<index>[,block_size=<n>]."
+            "Replay nullspace: from-metadata, none, constant, or field:<index>[,block_size=<n>]."
         ),
     )
     tune.add_argument(
@@ -881,14 +306,19 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     tune.add_argument(
-        "--no-deduplicate-matrices",
-        action="store_true",
+        "--no-deduplicate-matrices", dest="deduplicate_matrices",
+        action="store_false",
         help="Do not hash duplicate matrix candidates when writing the resolved snapshot collection.",
     )
     tune.add_argument(
-        "--no-reuse-ksp-setup",
-        action="store_true",
+        "--no-reuse-ksp-setup", dest="reuse_ksp_setup",
+        action="store_false",
         help="Do not reuse KSP/PC setup across snapshots with identical matrix cache keys.",
+    )
+    tune.add_argument(
+        "--no-initial-guess", dest="use_initial_guess",
+        action="store_false",
+        help="Replay solves from the zero vector instead of using the exported x0 vectors.",
     )
     tune.add_argument(
         "--replay-cache-memory-mb",
@@ -896,11 +326,37 @@ def build_parser() -> argparse.ArgumentParser:
         help="Approximate total replay-server cache memory budget per worker.",
     )
     tune.add_argument(
+        "--hypre-hierarchy-diagnostics",
+        choices=["auto", "on", "off"],
+        help=(
+            "Collect BoomerAMG hierarchy diagnostics when supported by the linked PETSc "
+            "build. Default: auto."
+        ),
+    )
+    tune.add_argument(
+        "--max-true-relative-residual",
+        type=float,
+        help="Reject PETSc-converged trials whose measured true relative residual exceeds this value.",
+    )
+    tune.add_argument(
+        "--max-true-residual-norm",
+        type=float,
+        help="Reject PETSc-converged trials whose measured true residual norm exceeds this value.",
+    )
+    tune.add_argument(
+        "--fast-fail",
+        action="store_true",
+        help=(
+            "Diagnostic mode: run real replay trials but force -ksp_max_it 1 "
+            "to expose crashing or very slow solver setups quickly."
+        ),
+    )
+    tune.add_argument(
         "--force-restart",
         action="store_true",
         help="Overwrite an existing tuning run directory instead of refusing to replace it.",
     )
-    tune.add_argument("--seed", type=int, default=1)
+    tune.add_argument("--seed", type=int)
     tune.add_argument("--dry-run", action="store_true")
     tune.add_argument(
         "--run-until-stopped",
@@ -909,12 +365,16 @@ def build_parser() -> argparse.ArgumentParser:
     )
     tune.add_argument(
         "--color",
-        choices=["auto", "always", "never"],
         default="auto",
+        choices=["auto", "always", "never"],
         help="Colorize tune output. Default: auto.",
     )
     tune.add_argument("--quiet", action="store_true")
-    tune.set_defaults(func=cmd_tune)
+    tune.set_defaults(func=cmd_tune, **{
+        setting.name: setting.default if setting.default is not MISSING else setting.default_factory()
+        for setting in fields(TuningSettings)
+        if setting.default is not MISSING or setting.default_factory is not MISSING
+    })
 
     resume = subparsers.add_parser("resume")
     resume.add_argument("tuning_run")
@@ -935,7 +395,42 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         help="Override the number of parallel SMAC workers for the resumed run.",
     )
-    resume.add_argument("--timeout-sec", type=float)
+    resume.add_argument(
+        "--soft-timeout-sec",
+        type=float,
+        help="Override the cumulative KSPSolve time budget per trial.",
+    )
+    resume.add_argument(
+        "--hard-timeout-sec",
+        type=float,
+        help="Override the Python-side safety timeout.",
+    )
+    resume.add_argument(
+        "--replay-startup-timeout-sec",
+        type=float,
+        help=(
+            "Override the timeout for the first request handled by a newly started replay server."
+        ),
+    )
+    resume.add_argument(
+        "--hypre-hierarchy-diagnostics",
+        choices=["auto", "on", "off"],
+        help=(
+            "Override BoomerAMG hierarchy diagnostics for the resumed run. "
+            "Default: use the saved run setting."
+        ),
+    )
+    resume.add_argument("--max-true-relative-residual", type=float)
+    resume.add_argument("--max-true-residual-norm", type=float)
+    resume.add_argument(
+        "--fast-fail",
+        action="store_true",
+        default=None,
+        help=(
+            "Diagnostic mode: run real replay trials but force -ksp_max_it 1 "
+            "to expose crashing or very slow solver setups quickly."
+        ),
+    )
     resume.add_argument(
         "--color",
         choices=["auto", "always", "never"],
@@ -956,14 +451,13 @@ def build_parser() -> argparse.ArgumentParser:
     analyze_snapshots.add_argument("--mpiexec", default="mpiexec")
     analyze_snapshots.add_argument("--np", type=int, default=1)
     analyze_snapshots.add_argument("--threads-per-rank", type=int, default=1)
-    analyze_snapshots.add_argument("--solve-index", type=int)
+    snapshot_selection = analyze_snapshots.add_mutually_exclusive_group()
+    snapshot_selection.add_argument("--solve-index", type=int)
+    snapshot_selection.add_argument("--snapshot-id")
     analyze_snapshots.add_argument(
         "--nullspace",
         default="none",
-        help=(
-            "Candidate nullspace to test: none, constant, or "
-            "field:<index>[,block_size=<n>]."
-        ),
+        help=("Candidate nullspace to test: none, constant, or field:<index>[,block_size=<n>]."),
     )
     analyze_snapshots.add_argument("--rhs-compatibility-tolerance", type=float, default=1.0e-10)
     analyze_snapshots.add_argument("--nullspace-residual-tolerance", type=float, default=1.0e-10)
@@ -982,6 +476,47 @@ def build_parser() -> argparse.ArgumentParser:
     export_options = subparsers.add_parser("export-petsc-options")
     export_options.add_argument("--tuning-run", required=True)
     export_options.set_defaults(func=cmd_export_petsc_options)
+
+    petsc_options = subparsers.add_parser(
+        "petsc-options",
+        aliases=["petsc-parameters"],
+        help="Query PETSc options exposed by the linked PETSc version.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=("example:\n  ksptune petsc-options -pc_type hypre -pc_hypre_type boomeramg"),
+    )
+    petsc_options.add_argument("--replay-binary")
+    petsc_options.add_argument("--mpiexec", default="mpiexec")
+    petsc_options.add_argument(
+        "--mpiexec-arg",
+        action="append",
+        default=[],
+        help=(
+            "Additional argument passed to the MPI launcher. Repeat for multiple arguments. "
+            "Use --mpiexec-arg=--flag when the launcher argument starts with '-'."
+        ),
+    )
+    petsc_options.add_argument("--np", type=int, default=1)
+    petsc_options.add_argument("--timeout-sec", type=float, default=30.0)
+    petsc_options.add_argument("-ksp_type", "--ksp-type")
+    petsc_options.add_argument("-pc_type", "--pc-type")
+    petsc_options.add_argument("-pc_hypre_type", "--pc-hypre-type")
+    petsc_options.add_argument(
+        "--filter",
+        action="append",
+        help="Only print PETSc option lines starting with this prefix. Repeatable.",
+    )
+    petsc_options.add_argument(
+        "--raw",
+        action="store_true",
+        help="Print full PETSc -help output instead of inferred option lines.",
+    )
+    petsc_options.add_argument("--json", action="store_true")
+    petsc_options.add_argument(
+        "petsc_options",
+        nargs=argparse.REMAINDER,
+        help="Additional PETSc options after --, for example -- -mat_type aij.",
+    )
+    petsc_options.set_defaults(func=cmd_petsc_options)
 
     return parser
 
