@@ -28,7 +28,7 @@ Especially algebraic multigrid methods (gamg, hypre boomeramg) have many importa
 
 If you find KSPTune useful in your research, please consider citing the following articles:
 
-First mention of what developed into KSPTune:
+Paper that first used KSPTune:
 
 Greiner, J., Sankarankutty, A. C., Seemann, G., Seidel, T., and Sachse, F. B. (2018). [Confocal microscopy-based estimation of parameters for computational modeling of electrical conduction in the normal and infarcted heart](https://doi.org/10.3389/fphys.2018.00239). *Frontiers in Physiology*, 9, Article 239.
 
