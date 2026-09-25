@@ -1,3 +1,0 @@
-# PETSc Dump Fixtures
-
-TBD.

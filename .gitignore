@@ -12,8 +12,7 @@ __pycache__/
 .coverage
 htmlcov/
 runs/
-examples/petsc_dumps/downloaded/
-examples/petsc_dumps/**/*.bin
+/examples/petsc_dumps/
 /examples/10x10x10_snapshots_indices_1_5_10_50_100/
 /examples/6x5x4_snapshots_indices_1_5_10_50_100/
 /examples/combined_dumps/
