@@ -11,18 +11,18 @@ After the snapshots are exported, a python interface runs an optimisation on the
 
 We observed substantial speedups over default parameters on cardiac simulation using the monodomain, bidomain, and EMI model, but the method is general and can be applied to any PETSc solver.
 
-[Documentation](https://joegreiner.github.io/KSPTune/) ·
-[Installation](docs/installation.md) · [openCARP step-by-step example](docs/opencarp.md) ·
-[Parameter files](docs/parameter-files.md)
+[Documentation](https://joegreiner.github.io/KSPTune/) 
+[Installation](https://joegreiner.github.io/KSPTune/installation/)  [openCARP step-by-step example](https://joegreiner.github.io/KSPTune/opencarp/) 
+[Parameter files](https://joegreiner.github.io/KSPTune/parameter-files/)
 
 # Experiments: speedups over default parameters
 
 These speedups depend, of course, on the problem size and the solver configuration.
 Especially algebraic multigrid methods (gamg, hypre boomeramg) have many important parameters that can be tuned.
 
-* Monodomain, atrial simulations: 1.7x speedup (tuned: CG+SPAI, default: bjacobi+ilu+cg, openCARP)
-* Bidomain, synthetic cube geometry with conductivity hetereogeneity: 11.2x speedup (tuned: fgmres/fieldsplit hupre AMG, default: bjacobi+ilu+cg, CEPS)
-* EMI, synthetic myocyte meshes: 4.0x speedup (tuned: fgmres+hypre AMG, default: hypre AMG + cg)
+* Monodomain, atrial simulations: **1.7x speedup** (tuned: CG+SPAI, default: bjacobi+ilu+cg, openCARP)
+* Bidomain, synthetic cube geometry with conductivity hetereogeneity: **11.2x speedup** (tuned: fgmres/fieldsplit hupre AMG, default: bjacobi+ilu+cg, CEPS)
+* EMI, synthetic myocyte meshes: **4.0x speedup** (tuned: fgmres+hypre AMG, default: hypre AMG + cg, openCARP)
 
 # Citation
 
