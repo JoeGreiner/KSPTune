@@ -85,6 +85,9 @@ def resolve_hypre_hierarchy_diagnostics(
     mode: str | None,
     replay_binary: str | Path | None,
     dry_run: bool,
+    mpiexec: str = "mpiexec",
+    mpiexec_args: list[str] | None = None,
+    mpi_processes: int = 1,
 ) -> dict[str, Any]:
     resolved_mode = "auto" if mode is None else str(mode)
     if resolved_mode not in HYPRE_HIERARCHY_DIAGNOSTICS_MODES:
@@ -107,6 +110,9 @@ def resolve_hypre_hierarchy_diagnostics(
     help_result = query_petsc_options_help(
         replay_binary=replay_binary,
         petsc_options=["-pc_type", "hypre", "-pc_hypre_type", "boomeramg"],
+        mpiexec=mpiexec,
+        mpiexec_args=mpiexec_args,
+        mpi_processes=mpi_processes,
         filters=[HYPRE_HIERARCHY_OPTION],
         raw=False,
         timeout_sec=10.0,
@@ -714,6 +720,9 @@ def prepare_tuning(
         mode=settings.hypre_hierarchy_diagnostics,
         replay_binary=replay_binary,
         dry_run=settings.dry_run,
+        mpiexec=settings.mpiexec,
+        mpiexec_args=settings.mpiexec_args,
+        mpi_processes=settings.mpi_processes,
     )
     replay_options = [*nullspace["replay_options"], *actions["replay_options"]]
     if not settings.reuse_ksp_setup:
