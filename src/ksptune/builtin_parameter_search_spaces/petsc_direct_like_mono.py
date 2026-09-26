@@ -130,7 +130,7 @@ def create_parameter_search_space(seed: int = 1) -> ConfigurationSpace:
     )
 
     # Solver/PC pairings from quick trials.
-    space.add_forbidden_clauses(
+    space.add(
         [
             ForbiddenAndConjunction(
                 ForbiddenEqualsClause(ksp_type, "cg"),
