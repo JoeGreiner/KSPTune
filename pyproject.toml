@@ -11,10 +11,11 @@ dependencies = [
   "ConfigSpace>=1.2",
   "PyYAML>=6",
   "smac>=2.4",
+  "scikit-learn>=1.3,<1.9",
 ]
 
 [project.optional-dependencies]
-analysis = ["pandas>=2.2", "scikit-learn>=1.3"]
+analysis = ["pandas>=2.2"]
 dev = ["pytest>=8", "pytest-cov>=5", "ruff>=0.8", "mypy>=1.11"]
 
 [project.scripts]
